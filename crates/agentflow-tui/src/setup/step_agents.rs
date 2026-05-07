@@ -10,26 +10,65 @@ use crate::setup::{AgentConfig, SetupConfig};
 use crate::util::theme::Theme;
 use crate::widgets::select::SelectableListState;
 
-const MODELS: &[&str] = &[
+const MODELS_ANTHROPIC: &[&str] = &[
+    "anthropic/claude-sonnet-4-5",
+    "anthropic/claude-3-5-sonnet",
+    "anthropic/claude-3-haiku-20240307",
+];
+
+const MODELS_GEMINI: &[&str] = &[
+    "gemini/gemini-2.5-pro",
+    "gemini/gemini-2.5-flash",
+    "gemini/gemini-2.0-flash-exp",
+];
+
+const MODELS_OPENAI: &[&str] = &[
+    "openai/gpt-4o",
+    "openai/gpt-4o-mini",
+    "openai/gpt-4-turbo",
+];
+
+const MODELS_GROQ: &[&str] = &[
+    "groq/llama-3.3-70b-versatile",
+    "groq/llama-3.1-8b-instant",
+];
+
+const MODELS_FIREWORKS: &[&str] = &[
+    "fireworks/accounts/fireworks/models/llama-v3p1-8b-instruct",
+    "fireworks/accounts/fireworks/models/glm-5",
+];
+
+const MODELS_ALL: &[&str] = &[
     "anthropic/claude-sonnet-4-5",
     "anthropic/claude-3-5-sonnet",
     "gemini/gemini-2.5-pro",
     "openai/gpt-4o",
-    "openai/gpt-4o-mini",
     "groq/llama-3.3-70b-versatile",
-    "fireworks/accounts/fireworks/models/glm-5",
 ];
+
+fn get_models_for_provider(provider: Option<&str>) -> Vec<&'static str> {
+    match provider {
+        Some(p) if p.contains("Anthropic") => MODELS_ANTHROPIC.to_vec(),
+        Some(p) if p.contains("Gemini") || p.contains("Google") => MODELS_GEMINI.to_vec(),
+        Some(p) if p.contains("OpenAI") => MODELS_OPENAI.to_vec(),
+        Some(p) if p.contains("Groq") => MODELS_GROQ.to_vec(),
+        Some(p) if p.contains("Fireworks") => MODELS_FIREWORKS.to_vec(),
+        _ => MODELS_ALL.to_vec(),
+    }
+}
 
 enum AgentConfigState {
     MainList {
         agents: Vec<AgentConfig>,
         selected: usize,
         focused_field: usize,
+        available_models: Vec<&'static str>,
     },
     ModelPicker {
         agents: Vec<AgentConfig>,
         agent_idx: usize,
         selected: usize,
+        available_models: Vec<&'static str>,
     },
 }
 
@@ -70,6 +109,10 @@ impl AgentsStep {
         }
 
         // Default agents if registry doesn't exist
+        // Get provider-specific models or default models
+        let available_models = get_models_for_provider(config.selected_provider.as_deref());
+        let default_model = available_models.first().unwrap_or(&"anthropic/claude-sonnet-4-5");
+
         // Nexus always has exactly 1 instance (immutable)
         if agents.is_empty() {
             agents.push(AgentConfig {
@@ -77,7 +120,7 @@ impl AgentsStep {
                 cli: "claude".to_string(),
                 active: true,
                 instances: 1, // Nexus is always 1 instance (orchestrator singleton)
-                model_backend: Some("anthropic/claude-sonnet-4-5".to_string()),
+                model_backend: Some(default_model.to_string()),
                 routing_key: Some("nexus-key".to_string()),
                 github_token_env: Some("AGENT_NEXUS_GITHUB_TOKEN".to_string()),
             });
@@ -86,7 +129,7 @@ impl AgentsStep {
                 cli: "claude".to_string(),
                 active: true,
                 instances: 2,
-                model_backend: Some("anthropic/claude-sonnet-4-5".to_string()),
+                model_backend: Some(default_model.to_string()),
                 routing_key: Some("forge-key".to_string()),
                 github_token_env: Some("AGENT_FORGE_GITHUB_TOKEN".to_string()),
             });
@@ -95,7 +138,7 @@ impl AgentsStep {
                 cli: "claude".to_string(),
                 active: true,
                 instances: 1,
-                model_backend: Some("gemini/gemini-2.5-pro".to_string()),
+                model_backend: Some(default_model.to_string()),
                 routing_key: Some("sentinel-key".to_string()),
                 github_token_env: Some("AGENT_SENTINEL_GITHUB_TOKEN".to_string()),
             });
@@ -104,7 +147,7 @@ impl AgentsStep {
                 cli: "claude".to_string(),
                 active: true,
                 instances: 1,
-                model_backend: Some("groq/llama-3.3-70b-versatile".to_string()),
+                model_backend: Some(default_model.to_string()),
                 routing_key: Some("vessel-key".to_string()),
                 github_token_env: Some("AGENT_VESSEL_GITHUB_TOKEN".to_string()),
             });
@@ -113,7 +156,7 @@ impl AgentsStep {
                 cli: "claude".to_string(),
                 active: true,
                 instances: 1,
-                model_backend: Some("openai/gpt-4o-mini".to_string()),
+                model_backend: Some(default_model.to_string()),
                 routing_key: Some("lore-key".to_string()),
                 github_token_env: Some("AGENT_LORE_GITHUB_TOKEN".to_string()),
             });
@@ -123,11 +166,12 @@ impl AgentsStep {
             agents,
             selected: 0,
             focused_field: 0,
+            available_models,
         };
 
         loop {
             match &mut state {
-                AgentConfigState::MainList { agents, selected, focused_field } => {
+                AgentConfigState::MainList { agents, selected, focused_field, available_models } => {
                     loop {
                         terminal.draw(|f| {
                             let area = f.area();
@@ -308,7 +352,7 @@ impl AgentsStep {
                                                 .model_backend
                                                 .as_deref()
                                                 .unwrap_or("");
-                                            let initial_idx = MODELS
+                                            let initial_idx = available_models
                                                 .iter()
                                                 .position(|m| *m == current_model)
                                                 .unwrap_or(0);
@@ -316,6 +360,7 @@ impl AgentsStep {
                                                 agents: agents.clone(),
                                                 agent_idx: *selected,
                                                 selected: initial_idx,
+                                                available_models: available_models.clone(),
                                             };
                                             break;
                                         }
@@ -329,10 +374,10 @@ impl AgentsStep {
                         }
                     }
                 }
-                AgentConfigState::ModelPicker { agents, agent_idx, selected } => {
+                AgentConfigState::ModelPicker { agents, agent_idx, selected, available_models } => {
                     let agent_idx_val = *agent_idx;
                     let mut list_state = SelectableListState::new(
-                        MODELS.iter().map(|s| s.to_string()).collect(),
+                        available_models.iter().map(|s| s.to_string()).collect(),
                     );
                     list_state.selected = *selected;
 
@@ -388,11 +433,12 @@ impl AgentsStep {
                                     KeyCode::Down => list_state.move_down(),
                                     KeyCode::Enter => {
                                         agents[agent_idx_val].model_backend =
-                                            Some(MODELS[list_state.selected].to_string());
+                                            Some(available_models[list_state.selected].to_string());
                                         state = AgentConfigState::MainList {
                                             agents: agents.clone(),
                                             selected: agent_idx_val,
                                             focused_field: 2,
+                                            available_models: available_models.clone(),
                                         };
                                         break;
                                     }
@@ -401,6 +447,7 @@ impl AgentsStep {
                                             agents: agents.clone(),
                                             selected: agent_idx_val,
                                             focused_field: 2,
+                                            available_models: available_models.clone(),
                                         };
                                         break;
                                     }

@@ -14,6 +14,7 @@ use crate::widgets::infobox::KeyValueBox;
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ConfigAction {
     UseExisting,
+    EditExisting,
     Reconfigure,
     Cancel,
 }
@@ -82,6 +83,28 @@ impl ExistingConfigStep {
             }
         }
 
+        // Also load agents from registry.json
+        let registry_path = project_dir
+            .join("orchestration")
+            .join("agent")
+            .join("registry.json");
+        
+        if registry_path.exists() {
+            if let Ok(registry) = config::Registry::load(&registry_path) {
+                config.agents = registry.team.iter().map(|entry| {
+                    crate::setup::AgentConfig {
+                        id: entry.id.clone(),
+                        cli: entry.cli.clone(),
+                        active: entry.active,
+                        instances: entry.instances,
+                        model_backend: entry.model_backend.clone(),
+                        routing_key: entry.routing_key.clone(),
+                        github_token_env: entry.github_token_env.clone(),
+                    }
+                }).collect();
+            }
+        }
+
         Some(config)
     }
 
@@ -107,8 +130,9 @@ impl ExistingConfigStep {
         }
 
         let actions = vec![
-            "Use existing values".to_string(),
-            "Reconfigure everything".to_string(),
+            "Use existing values (skip setup)".to_string(),
+            "Edit existing values".to_string(),
+            "Reconfigure everything from scratch".to_string(),
             "Cancel setup".to_string(),
         ];
         let mut selected = 0;
@@ -195,11 +219,12 @@ impl ExistingConfigStep {
                         KeyCode::Enter => {
                             self.action = match selected {
                                 0 => ConfigAction::UseExisting,
-                                1 => ConfigAction::Reconfigure,
-                                2 => ConfigAction::Cancel,
+                                1 => ConfigAction::EditExisting,
+                                2 => ConfigAction::Reconfigure,
+                                3 => ConfigAction::Cancel,
                                 _ => ConfigAction::UseExisting,
                             };
-                            if self.action == ConfigAction::UseExisting {
+                            if matches!(self.action, ConfigAction::UseExisting | ConfigAction::EditExisting) {
                                 if let Some(ref existing) = self.existing_config {
                                     *config = existing.clone();
                                 }
