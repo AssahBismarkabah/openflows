@@ -10,6 +10,7 @@ use crate::util::env_check;
 use crate::util::theme::Theme;
 use crate::widgets::check::{CheckList, CheckState};
 
+#[derive(Default)]
 pub struct EnvStep {
     checks: Vec<(String, CheckState)>,
 }
@@ -33,13 +34,19 @@ impl EnvStep {
         if let Some(version) = env_check::check_node() {
             checks.push((format!("Node.js {}", version), CheckState::Pass));
         } else {
-            checks.push(("Node.js not found (for GitHub MCP)".to_string(), CheckState::Warn));
+            checks.push((
+                "Node.js not found (for GitHub MCP)".to_string(),
+                CheckState::Warn,
+            ));
         }
 
         if let Some(version) = env_check::check_claude() {
             checks.push((format!("Claude Code CLI {}", version), CheckState::Pass));
         } else {
-            checks.push(("Claude Code CLI not found (required)".to_string(), CheckState::Fail));
+            checks.push((
+                "Claude Code CLI not found (required)".to_string(),
+                CheckState::Fail,
+            ));
         }
 
         Self { checks }

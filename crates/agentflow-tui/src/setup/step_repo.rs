@@ -11,6 +11,7 @@ use crate::util::theme::Theme;
 use crate::widgets::check::{CheckList, CheckState};
 use crate::widgets::input::InputWidget;
 
+#[derive(Default)]
 pub struct RepoStep;
 
 impl RepoStep {
@@ -23,7 +24,10 @@ impl RepoStep {
         let home = std::env::var("HOME")
             .or_else(|_| std::env::var("USERPROFILE"))
             .unwrap_or_else(|_| ".".to_string());
-        let dir_name = repo.replace('/', "-").replace('\\', "-");
+        let dir_name: String = repo
+            .chars()
+            .map(|c| if c == '/' || c == '\\' { '-' } else { c })
+            .collect();
         format!("{}/.agentflow/workspaces/{}", home, dir_name)
     }
 
@@ -70,7 +74,12 @@ impl RepoStep {
                 );
                 let title_para = ratatui::widgets::Paragraph::new(vec![title, subtitle]);
                 title_para.render(
-                    ratatui::layout::Rect { x: 2, y: y_start, width: area.width - 4, height: 2 },
+                    ratatui::layout::Rect {
+                        x: 2,
+                        y: y_start,
+                        width: area.width - 4,
+                        height: 2,
+                    },
                     f.buffer_mut(),
                 );
 
@@ -80,8 +89,8 @@ impl RepoStep {
                     width: area.width - 4,
                     height: 3,
                 };
-                let repo_widget = InputWidget::new(&repo_input, "GitHub Repository")
-                    .focused(focused_field == 0);
+                let repo_widget =
+                    InputWidget::new(&repo_input, "GitHub Repository").focused(focused_field == 0);
                 repo_widget.render(repo_widget_area, f.buffer_mut());
 
                 let ws_widget_area = ratatui::layout::Rect {
@@ -90,8 +99,9 @@ impl RepoStep {
                     width: area.width - 4,
                     height: 3,
                 };
-                let ws_widget = InputWidget::new(&workspace_input, "Workspace Directory (auto-derived)")
-                    .focused(false); // Never focused - auto-derived from repo
+                let ws_widget =
+                    InputWidget::new(&workspace_input, "Workspace Directory (auto-derived)")
+                        .focused(false); // Never focused - auto-derived from repo
                 ws_widget.render(ws_widget_area, f.buffer_mut());
 
                 let mut checks = Vec::new();
@@ -104,7 +114,10 @@ impl RepoStep {
                     ));
                 }
                 // Workspace is always valid since it's auto-derived to ~/.agentflow/workspaces/
-                checks.push(("Workspace directory (auto-derived to ~/.agentflow)".to_string(), CheckState::Pass));
+                checks.push((
+                    "Workspace directory (auto-derived to ~/.agentflow)".to_string(),
+                    CheckState::Pass,
+                ));
                 let check_area = ratatui::layout::Rect {
                     x: 2,
                     y: y_start + 11,

@@ -22,16 +22,9 @@ const MODELS_GEMINI: &[&str] = &[
     "gemini/gemini-2.0-flash-exp",
 ];
 
-const MODELS_OPENAI: &[&str] = &[
-    "openai/gpt-4o",
-    "openai/gpt-4o-mini",
-    "openai/gpt-4-turbo",
-];
+const MODELS_OPENAI: &[&str] = &["openai/gpt-4o", "openai/gpt-4o-mini", "openai/gpt-4-turbo"];
 
-const MODELS_GROQ: &[&str] = &[
-    "groq/llama-3.3-70b-versatile",
-    "groq/llama-3.1-8b-instant",
-];
+const MODELS_GROQ: &[&str] = &["groq/llama-3.3-70b-versatile", "groq/llama-3.1-8b-instant"];
 
 const MODELS_FIREWORKS: &[&str] = &[
     "fireworks/accounts/fireworks/models/llama-v3p1-8b-instruct",
@@ -72,6 +65,7 @@ enum AgentConfigState {
     },
 }
 
+#[derive(Default)]
 pub struct AgentsStep;
 
 impl AgentsStep {
@@ -111,7 +105,9 @@ impl AgentsStep {
         // Default agents if registry doesn't exist
         // Get provider-specific models or default models
         let available_models = get_models_for_provider(config.selected_provider.as_deref());
-        let default_model = available_models.first().unwrap_or(&"anthropic/claude-sonnet-4-5");
+        let default_model = available_models
+            .first()
+            .unwrap_or(&"anthropic/claude-sonnet-4-5");
 
         // Nexus always has exactly 1 instance (immutable)
         if agents.is_empty() {
@@ -171,7 +167,12 @@ impl AgentsStep {
 
         loop {
             match &mut state {
-                AgentConfigState::MainList { agents, selected, focused_field, available_models } => {
+                AgentConfigState::MainList {
+                    agents,
+                    selected,
+                    focused_field,
+                    available_models,
+                } => {
                     loop {
                         terminal.draw(|f| {
                             let area = f.area();
@@ -337,12 +338,18 @@ impl AgentsStep {
                                         }
                                     }
                                     KeyCode::Left => {
-                                        if *focused_field == 1 && agents[*selected].id != "nexus" && agents[*selected].instances > 1 {
+                                        if *focused_field == 1
+                                            && agents[*selected].id != "nexus"
+                                            && agents[*selected].instances > 1
+                                        {
                                             agents[*selected].instances -= 1;
                                         }
                                     }
                                     KeyCode::Right => {
-                                        if *focused_field == 1 && agents[*selected].id != "nexus" && agents[*selected].instances < 10 {
+                                        if *focused_field == 1
+                                            && agents[*selected].id != "nexus"
+                                            && agents[*selected].instances < 10
+                                        {
                                             agents[*selected].instances += 1;
                                         }
                                     }
@@ -374,7 +381,12 @@ impl AgentsStep {
                         }
                     }
                 }
-                AgentConfigState::ModelPicker { agents, agent_idx, selected, available_models } => {
+                AgentConfigState::ModelPicker {
+                    agents,
+                    agent_idx,
+                    selected,
+                    available_models,
+                } => {
                     let agent_idx_val = *agent_idx;
                     let mut list_state = SelectableListState::new(
                         available_models.iter().map(|s| s.to_string()).collect(),
@@ -402,19 +414,23 @@ impl AgentsStep {
 
                             let title = Line::styled(
                                 "◇ SELECT MODEL BACKEND",
-                                Style::default().fg(theme.accent()).add_modifier(Modifier::BOLD),
+                                Style::default()
+                                    .fg(theme.accent())
+                                    .add_modifier(Modifier::BOLD),
                             );
                             let subtitle = Line::styled(
                                 format!("  Choose model for agent: {}", agents[agent_idx_val].id),
                                 Style::default().fg(theme.muted()),
                             );
-                            let title_para = ratatui::widgets::Paragraph::new(vec![title, subtitle]);
+                            let title_para =
+                                ratatui::widgets::Paragraph::new(vec![title, subtitle]);
                             title_para.render(inner_title, f.buffer_mut());
 
                             let list_widget = crate::widgets::select::SelectableList::new(
                                 &list_state.items,
                                 list_state.selected,
-                            ).title("Select model backend");
+                            )
+                            .title("Select model backend");
                             list_widget.render(chunks[1], f.buffer_mut());
 
                             let help = Line::styled(

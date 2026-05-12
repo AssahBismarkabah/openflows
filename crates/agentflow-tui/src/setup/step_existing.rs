@@ -24,6 +24,15 @@ pub struct ExistingConfigStep {
     existing_config: Option<SetupConfig>,
 }
 
+impl Default for ExistingConfigStep {
+    fn default() -> Self {
+        Self {
+            action: ConfigAction::UseExisting,
+            existing_config: None,
+        }
+    }
+}
+
 impl ExistingConfigStep {
     pub fn new() -> Self {
         Self {
@@ -75,8 +84,11 @@ impl ExistingConfigStep {
                     "GATEWAY_API_KEY" => config.gateway_api_key = Some(value.to_string()),
                     _ => {
                         // Capture per-agent tokens
-                        if key.trim().starts_with("AGENT_") && key.trim().ends_with("_GITHUB_TOKEN") {
-                            config.agent_tokens.push((key.trim().to_string(), value.to_string()));
+                        if key.trim().starts_with("AGENT_") && key.trim().ends_with("_GITHUB_TOKEN")
+                        {
+                            config
+                                .agent_tokens
+                                .push((key.trim().to_string(), value.to_string()));
                         }
                     }
                 }
@@ -88,11 +100,13 @@ impl ExistingConfigStep {
             .join("orchestration")
             .join("agent")
             .join("registry.json");
-        
+
         if registry_path.exists() {
             if let Ok(registry) = config::Registry::load(&registry_path) {
-                config.agents = registry.team.iter().map(|entry| {
-                    crate::setup::AgentConfig {
+                config.agents = registry
+                    .team
+                    .iter()
+                    .map(|entry| crate::setup::AgentConfig {
                         id: entry.id.clone(),
                         cli: entry.cli.clone(),
                         active: entry.active,
@@ -100,8 +114,8 @@ impl ExistingConfigStep {
                         model_backend: entry.model_backend.clone(),
                         routing_key: entry.routing_key.clone(),
                         github_token_env: entry.github_token_env.clone(),
-                    }
-                }).collect();
+                    })
+                    .collect();
             }
         }
 
@@ -129,7 +143,7 @@ impl ExistingConfigStep {
             return Ok(());
         }
 
-        let actions = vec![
+        let actions = [
             "Use existing values (skip setup)".to_string(),
             "Edit existing values".to_string(),
             "Reconfigure everything from scratch".to_string(),
@@ -160,19 +174,21 @@ impl ExistingConfigStep {
                 let title_para = Paragraph::new(title_line);
                 title_para.render(chunks[0], f.buffer_mut());
 
-                let sep_line = Line::styled(
-                    "│",
-                    Style::default().fg(theme.border()),
-                );
+                let sep_line = Line::styled("│", Style::default().fg(theme.border()));
                 let sep_para = Paragraph::new(sep_line);
                 sep_para.render(chunks[1], f.buffer_mut());
 
                 let prompt_line = Line::styled(
                     "◇  Existing config detected",
-                    Style::default().fg(theme.accent()).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(theme.accent())
+                        .add_modifier(Modifier::BOLD),
                 );
                 let prompt_para = Paragraph::new(prompt_line);
-                prompt_para.render(Rect::new(chunks[2].x, chunks[2].y, chunks[2].width, 1), f.buffer_mut());
+                prompt_para.render(
+                    Rect::new(chunks[2].x, chunks[2].y, chunks[2].width, 1),
+                    f.buffer_mut(),
+                );
 
                 if let Some(ref existing) = self.existing_config {
                     let kv_box = KeyValueBox::new("Current configuration")
@@ -211,7 +227,11 @@ impl ExistingConfigStep {
                     use crossterm::event::KeyCode;
                     match key.code {
                         KeyCode::Up => {
-                            selected = if selected == 0 { actions.len() - 1 } else { selected - 1 };
+                            selected = if selected == 0 {
+                                actions.len() - 1
+                            } else {
+                                selected - 1
+                            };
                         }
                         KeyCode::Down => {
                             selected = (selected + 1) % actions.len();
@@ -224,7 +244,10 @@ impl ExistingConfigStep {
                                 3 => ConfigAction::Cancel,
                                 _ => ConfigAction::UseExisting,
                             };
-                            if matches!(self.action, ConfigAction::UseExisting | ConfigAction::EditExisting) {
+                            if matches!(
+                                self.action,
+                                ConfigAction::UseExisting | ConfigAction::EditExisting
+                            ) {
                                 if let Some(ref existing) = self.existing_config {
                                     *config = existing.clone();
                                 }

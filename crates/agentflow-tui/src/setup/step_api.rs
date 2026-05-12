@@ -19,6 +19,7 @@ struct ApiField {
     required: bool,
 }
 
+#[derive(Default)]
 pub struct ApiStep;
 
 impl ApiStep {
@@ -62,25 +63,31 @@ impl ApiStep {
                 required: true,
             }),
             "LiteLLM Proxy" => {
-                let mut proxy_fields = Vec::new();
-                proxy_fields.push(ApiField {
-                    label: "LiteLLM Proxy URL".to_string(),
-                    env_key: "LITELLM_URL".to_string(),
-                    input: Input::new(std::env::var("LITELLM_URL").unwrap_or_default()),
-                    required: true,
-                });
-                proxy_fields.push(ApiField {
-                    label: "LiteLLM API Key (optional)".to_string(),
-                    env_key: "LITELLM_API_KEY".to_string(),
-                    input: Input::new(std::env::var("LITELLM_API_KEY").unwrap_or_default()),
-                    required: false,
-                });
-                return self.render_fields(terminal, theme, config, proxy_fields, &provider_name).await;
+                let proxy_fields = vec![
+                    ApiField {
+                        label: "LiteLLM Proxy URL".to_string(),
+                        env_key: "LITELLM_URL".to_string(),
+                        input: Input::new(std::env::var("LITELLM_URL").unwrap_or_default()),
+                        required: true,
+                    },
+                    ApiField {
+                        label: "LiteLLM API Key (optional)".to_string(),
+                        env_key: "LITELLM_API_KEY".to_string(),
+                        input: Input::new(std::env::var("LITELLM_API_KEY").unwrap_or_default()),
+                        required: false,
+                    },
+                ];
+                return self
+                    .render_fields(terminal, theme, config, proxy_fields, &provider_name)
+                    .await;
             }
             "Ollama (Local)" => Some(ApiField {
                 label: "Ollama Host URL".to_string(),
                 env_key: "OLLAMA_HOST".to_string(),
-                input: Input::new(std::env::var("OLLAMA_HOST").unwrap_or_else(|_| "http://localhost:11434".to_string())),
+                input: Input::new(
+                    std::env::var("OLLAMA_HOST")
+                        .unwrap_or_else(|_| "http://localhost:11434".to_string()),
+                ),
                 required: true,
             }),
             "Skip for now" => return Ok(()),
@@ -95,7 +102,8 @@ impl ApiStep {
             return Ok(());
         }
 
-        self.render_fields(terminal, theme, config, fields, &provider_name).await
+        self.render_fields(terminal, theme, config, fields, &provider_name)
+            .await
     }
 
     async fn render_fields(
@@ -143,12 +151,13 @@ impl ApiStep {
                 let title_para = ratatui::widgets::Paragraph::new(vec![title, subtitle]);
                 title_para.render(inner_title, f.buffer_mut());
 
-                let input_area = Rect::new(chunks[1].x, chunks[1].y, chunks[1].width, chunks[1].height);
+                let input_area =
+                    Rect::new(chunks[1].x, chunks[1].y, chunks[1].width, chunks[1].height);
 
                 let mut current_y = input_area.y;
 
                 let field_height = 3u16;
-                
+
                 for (i, field) in fields.iter().enumerate() {
                     if current_y + field_height > input_area.y + input_area.height {
                         break;
@@ -186,7 +195,8 @@ impl ApiStep {
                             };
                         }
                         KeyCode::Enter => {
-                            let all_required_filled = fields.iter()
+                            let all_required_filled = fields
+                                .iter()
                                 .filter(|f| f.required)
                                 .all(|f| !f.input.value().is_empty());
 
@@ -196,46 +206,28 @@ impl ApiStep {
                                     match field.env_key.as_str() {
                                         "ANTHROPIC_API_KEY" => config.anthropic_key = value,
                                         "OPENAI_API_KEY" => {
-                                            config.openai_key = if value.is_empty() {
-                                                None
-                                            } else {
-                                                Some(value)
-                                            };
+                                            config.openai_key =
+                                                if value.is_empty() { None } else { Some(value) };
                                         }
                                         "GEMINI_API_KEY" => {
-                                            config.gemini_key = if value.is_empty() {
-                                                None
-                                            } else {
-                                                Some(value)
-                                            };
+                                            config.gemini_key =
+                                                if value.is_empty() { None } else { Some(value) };
                                         }
                                         "FIREWORKS_API_KEY" => {
-                                            config.fireworks_key = if value.is_empty() {
-                                                None
-                                            } else {
-                                                Some(value)
-                                            };
+                                            config.fireworks_key =
+                                                if value.is_empty() { None } else { Some(value) };
                                         }
                                         "LITELLM_URL" => {
-                                            config.proxy_url = if value.is_empty() {
-                                                None
-                                            } else {
-                                                Some(value)
-                                            };
+                                            config.proxy_url =
+                                                if value.is_empty() { None } else { Some(value) };
                                         }
                                         "LITELLM_API_KEY" => {
-                                            config.proxy_api_key = if value.is_empty() {
-                                                None
-                                            } else {
-                                                Some(value)
-                                            };
+                                            config.proxy_api_key =
+                                                if value.is_empty() { None } else { Some(value) };
                                         }
                                         "OLLAMA_HOST" => {
-                                            config.gateway_url = if value.is_empty() {
-                                                None
-                                            } else {
-                                                Some(value)
-                                            };
+                                            config.gateway_url =
+                                                if value.is_empty() { None } else { Some(value) };
                                         }
                                         _ => {}
                                     }

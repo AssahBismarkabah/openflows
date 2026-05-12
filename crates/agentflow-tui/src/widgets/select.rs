@@ -43,7 +43,10 @@ impl<'a> SelectableList<'a> {
 
     fn visible_items(&self) -> Vec<(usize, &String)> {
         if self.filtered_indices.is_empty() && self.show_search {
-            let query = self.search_query.map(|i| i.value().to_lowercase()).unwrap_or_default();
+            let query = self
+                .search_query
+                .map(|i| i.value().to_lowercase())
+                .unwrap_or_default();
             if query.is_empty() {
                 self.items.iter().enumerate().collect()
             } else {
@@ -69,7 +72,11 @@ impl Widget for SelectableList<'_> {
         let theme = crate::util::theme::Theme::default();
         let visible = self.visible_items();
 
-        let content_height = if self.show_search { area.height.saturating_sub(3) } else { area.height.saturating_sub(2) };
+        let content_height = if self.show_search {
+            area.height.saturating_sub(3)
+        } else {
+            area.height.saturating_sub(2)
+        };
 
         let scroll_offset = if self.selected >= content_height as usize {
             self.selected - content_height as usize + 1
@@ -90,7 +97,11 @@ impl Widget for SelectableList<'_> {
             lines.push(Line::raw(""));
         }
 
-        for (idx, item) in visible.iter().skip(scroll_offset).take(content_height as usize) {
+        for (idx, item) in visible
+            .iter()
+            .skip(scroll_offset)
+            .take(content_height as usize)
+        {
             let is_selected = *idx == self.selected;
             let icon = if is_selected { "▸" } else { " " };
             let style = if is_selected {
@@ -119,8 +130,7 @@ impl Widget for SelectableList<'_> {
             Span::styled(" back", Style::default().fg(theme.fg())),
         ]);
 
-        let block = Block::default()
-            .borders(Borders::NONE);
+        let block = Block::default().borders(Borders::NONE);
 
         let inner = block.inner(area);
         block.render(area, buf);
@@ -186,7 +196,10 @@ impl SelectableListState {
         if visible.is_empty() {
             return;
         }
-        let current_pos = visible.iter().position(|(i, _)| *i == self.selected).unwrap_or(0);
+        let current_pos = visible
+            .iter()
+            .position(|(i, _)| *i == self.selected)
+            .unwrap_or(0);
         if current_pos > 0 {
             self.selected = visible[current_pos - 1].0;
         } else {
@@ -199,7 +212,10 @@ impl SelectableListState {
         if visible.is_empty() {
             return;
         }
-        let current_pos = visible.iter().position(|(i, _)| *i == self.selected).unwrap_or(0);
+        let current_pos = visible
+            .iter()
+            .position(|(i, _)| *i == self.selected)
+            .unwrap_or(0);
         if current_pos < visible.len() - 1 {
             self.selected = visible[current_pos + 1].0;
         } else {

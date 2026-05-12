@@ -19,6 +19,7 @@ struct GitHubField {
     required: bool,
 }
 
+#[derive(Default)]
 pub struct GitHubStep;
 
 impl GitHubStep {
@@ -57,7 +58,9 @@ impl GitHubStep {
             if registry_path.exists() {
                 if let Ok(registry) = config::Registry::load(&registry_path) {
                     for entry in registry.active_agents() {
-                        let env_key = entry.github_token_env.clone()
+                        let env_key = entry
+                            .github_token_env
+                            .clone()
                             .unwrap_or_else(|| "GITHUB_PERSONAL_ACCESS_TOKEN".to_string());
                         let existing = std::env::var(&env_key).unwrap_or_default();
                         fields.push(GitHubField {
@@ -126,7 +129,7 @@ impl GitHubStep {
                 let field_height = 3u16;
                 let field_spacing = 0u16;
                 let total_per_field = field_height + field_spacing;
-                
+
                 let visible_count = ((input_area.height) / total_per_field).max(1) as usize;
                 let scroll_offset = focused_field.saturating_sub(visible_count.saturating_sub(1));
 
@@ -136,16 +139,12 @@ impl GitHubStep {
                     if i < scroll_offset || i >= scroll_offset + visible_count {
                         continue;
                     }
-                    
+
                     if current_y + field_height > input_area.y + input_area.height {
                         break;
                     }
 
-                    let label = if field.required {
-                        field.label.clone()
-                    } else {
-                        field.label.clone()
-                    };
+                    let label = field.label.clone();
 
                     let widget = InputWidget::new(&field.input, &label)
                         .masked(true)
@@ -193,7 +192,8 @@ impl GitHubStep {
                             };
                         }
                         KeyCode::Enter => {
-                            let all_required_filled = fields.iter()
+                            let all_required_filled = fields
+                                .iter()
                                 .filter(|f| f.required)
                                 .all(|f| !f.input.value().is_empty());
 
@@ -205,21 +205,33 @@ impl GitHubStep {
                                             config.github_pat = value.clone();
                                             // Also set this as the github_token_env for all active agents
                                             // when using the fallback single PAT
-                                            for agent in config.agents.iter_mut().filter(|a| a.active) {
-                                                agent.github_token_env = Some("GITHUB_PERSONAL_ACCESS_TOKEN".to_string());
+                                            for agent in
+                                                config.agents.iter_mut().filter(|a| a.active)
+                                            {
+                                                agent.github_token_env = Some(
+                                                    "GITHUB_PERSONAL_ACCESS_TOKEN".to_string(),
+                                                );
                                             }
                                         }
                                         _ => {
                                             if field.env_key.starts_with("AGENT_") {
-                                                config.agent_tokens.push((field.env_key.clone(), value));
+                                                config
+                                                    .agent_tokens
+                                                    .push((field.env_key.clone(), value));
                                                 // Set the github_token_env on the corresponding agent
-                                                let agent_id = field.env_key
+                                                let agent_id = field
+                                                    .env_key
                                                     .strip_prefix("AGENT_")
                                                     .and_then(|s| s.strip_suffix("_GITHUB_TOKEN"))
                                                     .map(|s| s.to_lowercase())
                                                     .unwrap_or_default();
-                                                if let Some(agent) = config.agents.iter_mut().find(|a| a.id == agent_id) {
-                                                    agent.github_token_env = Some(field.env_key.clone());
+                                                if let Some(agent) = config
+                                                    .agents
+                                                    .iter_mut()
+                                                    .find(|a| a.id == agent_id)
+                                                {
+                                                    agent.github_token_env =
+                                                        Some(field.env_key.clone());
                                                 }
                                             }
                                         }

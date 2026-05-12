@@ -79,7 +79,11 @@ impl Widget for InfoBox<'_> {
             .borders(Borders::ALL)
             .title(title_with_icon)
             .border_style(Style::default().fg(accent_color))
-            .title_style(Style::default().fg(accent_color).add_modifier(Modifier::BOLD));
+            .title_style(
+                Style::default()
+                    .fg(accent_color)
+                    .add_modifier(Modifier::BOLD),
+            );
 
         let inner = block.inner(area);
         block.render(area, buf);
