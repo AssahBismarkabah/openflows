@@ -19,6 +19,14 @@ pub struct ModeStep {
     selected_mode: SetupMode,
 }
 
+impl Default for ModeStep {
+    fn default() -> Self {
+        Self {
+            selected_mode: SetupMode::QuickStart,
+        }
+    }
+}
+
 impl ModeStep {
     pub fn new() -> Self {
         Self {
@@ -35,10 +43,7 @@ impl ModeStep {
         terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
         theme: &Theme,
     ) -> Result<()> {
-        let modes = vec![
-            "QuickStart".to_string(),
-            "Advanced".to_string(),
-        ];
+        let modes = vec!["QuickStart".to_string(), "Advanced".to_string()];
         let mut list_state = SelectableListState::new(modes);
 
         loop {
@@ -66,16 +71,15 @@ impl ModeStep {
                 let title_para = Paragraph::new(title_line);
                 title_para.render(chunks[0], f.buffer_mut());
 
-                let sep_line = Line::styled(
-                    "│",
-                    Style::default().fg(theme.border()),
-                );
+                let sep_line = Line::styled("│", Style::default().fg(theme.border()));
                 let sep_para = Paragraph::new(sep_line);
                 sep_para.render(chunks[1], f.buffer_mut());
 
                 let prompt_line = Line::styled(
                     "◇  Setup mode",
-                    Style::default().fg(theme.accent()).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(theme.accent())
+                        .add_modifier(Modifier::BOLD),
                 );
                 let prompt_para = Paragraph::new(prompt_line);
                 prompt_para.render(chunks[2], f.buffer_mut());
@@ -89,9 +93,15 @@ impl ModeStep {
                 let list_widget = crate::widgets::select::SelectableList::new(
                     &list_state.items,
                     list_state.selected,
-                ).title("Select setup mode");
+                )
+                .title("Select setup mode");
                 list_widget.render(
-                    Rect::new(chunks[3].x, chunks[3].y, chunks[3].width, chunks[3].height - 2),
+                    Rect::new(
+                        chunks[3].x,
+                        chunks[3].y,
+                        chunks[3].width,
+                        chunks[3].height - 2,
+                    ),
                     f.buffer_mut(),
                 );
 

@@ -16,8 +16,7 @@ pub const SETUP_HEADER: &str = "OpenFlows setup";
 pub const SECURITY_HEADER: &str = "Security disclaimer";
 
 pub fn version_string() -> String {
-    let git_hash = std::env::var("GIT_HASH")
-        .unwrap_or_else(|_| "dev".to_string());
+    let git_hash = std::env::var("GIT_HASH").unwrap_or_else(|_| "dev".to_string());
     format!("{} ({})", HEADER, git_hash)
 }
 

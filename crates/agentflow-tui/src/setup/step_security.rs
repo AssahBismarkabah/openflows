@@ -34,6 +34,7 @@ const DISCLAIMER_CONTENT: &[&str] = &[
     "- Review agent registry before running on production code",
 ];
 
+#[derive(Default)]
 pub struct SecurityStep {
     confirmed: bool,
 }
@@ -77,19 +78,21 @@ impl SecurityStep {
                 let title_para = Paragraph::new(title_line);
                 title_para.render(chunks[0], f.buffer_mut());
 
-                let box_content: Vec<String> = DISCLAIMER_CONTENT.iter().map(|s| s.to_string()).collect();
+                let box_content: Vec<String> =
+                    DISCLAIMER_CONTENT.iter().map(|s| s.to_string()).collect();
                 let info_box = InfoBox::new("Getting Started", &box_content);
                 info_box.render(chunks[1], f.buffer_mut());
 
                 let confirm_prompt = "  Ready to set up OpenFlow?";
-                let confirm_lines = vec![
-                    Line::styled(confirm_prompt.to_string(), theme.text_style()),
-                ];
+                let confirm_lines =
+                    vec![Line::styled(confirm_prompt.to_string(), theme.text_style())];
                 let confirm_para = Paragraph::new(confirm_lines);
-                confirm_para.render(Rect::new(chunks[2].x, chunks[2].y, chunks[2].width, 1), f.buffer_mut());
+                confirm_para.render(
+                    Rect::new(chunks[2].x, chunks[2].y, chunks[2].width, 1),
+                    f.buffer_mut(),
+                );
 
-                let dialog = ConfirmDialog::new("")
-                    .selected_yes(confirm_state.selected_yes);
+                let dialog = ConfirmDialog::new("").selected_yes(confirm_state.selected_yes);
                 let dialog_area = Rect::new(chunks[2].x, chunks[2].y + 2, chunks[2].width, 2);
                 dialog.render(dialog_area, f.buffer_mut());
             })?;

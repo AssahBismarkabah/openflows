@@ -1,15 +1,10 @@
 use ratatui::style::{Color, Modifier, Style};
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub enum Theme {
+    #[default]
     Dark,
     Light,
-}
-
-impl Default for Theme {
-    fn default() -> Self {
-        Theme::Dark
-    }
 }
 
 impl Theme {

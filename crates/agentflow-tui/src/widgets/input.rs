@@ -47,7 +47,7 @@ impl Widget for InputWidget<'_> {
             self.input.value().to_string()
         };
 
-        let label_suffix = if self.optional { "" } else { "" };
+        let label_suffix = "";
         let full_label = if self.label.ends_with(':') {
             format!(" {}{}", self.label.trim_end_matches(':'), label_suffix)
         } else {

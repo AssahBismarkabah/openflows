@@ -143,7 +143,9 @@ async fn run_wizard_inner(mut terminal: Terminal<CrosstermBackend<io::Stdout>>) 
 
     // Step 5: Provider selection (must come before agent config)
     let mut provider_step = ProviderStep::new();
-    provider_step.render(&mut terminal, &theme, &mut config).await?;
+    provider_step
+        .render(&mut terminal, &theme, &mut config)
+        .await?;
 
     // Step 6: LLM API Key Input (based on selected provider)
     let api_step = ApiStep::new();
@@ -151,11 +153,15 @@ async fn run_wizard_inner(mut terminal: Terminal<CrosstermBackend<io::Stdout>>) 
 
     // Step 7: Agent Configuration (instances, model backend filtered by provider)
     let agents_step = AgentsStep::new();
-    agents_step.render(&mut terminal, &theme, &mut config).await?;
+    agents_step
+        .render(&mut terminal, &theme, &mut config)
+        .await?;
 
     // Step 8: GitHub Authentication (uses agent config to determine token fields)
     let github_step = GitHubStep::new();
-    github_step.render(&mut terminal, &theme, &mut config).await?;
+    github_step
+        .render(&mut terminal, &theme, &mut config)
+        .await?;
 
     // Step 9: Repository Config
     let repo_step = RepoStep::new();
@@ -188,7 +194,10 @@ pub fn write_env_file(config: &SetupConfig, project_dir: &std::path::Path) -> Re
 
     // Also write the general GitHub PAT if set
     if !config.github_pat.is_empty() {
-        content.push_str(&format!("GITHUB_PERSONAL_ACCESS_TOKEN={}\n", config.github_pat));
+        content.push_str(&format!(
+            "GITHUB_PERSONAL_ACCESS_TOKEN={}\n",
+            config.github_pat
+        ));
     }
 
     content.push_str(&format!("GITHUB_REPOSITORY={}\n", config.repo));

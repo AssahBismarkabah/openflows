@@ -13,6 +13,7 @@ use crate::setup::SetupConfig;
 use crate::util::theme::Theme;
 use crate::widgets::check::{CheckList, CheckState};
 
+#[derive(Default)]
 pub struct DoneStep;
 
 impl DoneStep {
@@ -81,10 +82,7 @@ impl DoneStep {
 
                 let title_chunks = Layout::default()
                     .direction(Direction::Vertical)
-                    .constraints([
-                        Constraint::Length(1),
-                        Constraint::Length(1),
-                    ])
+                    .constraints([Constraint::Length(1), Constraint::Length(1)])
                     .split(chunks[0]);
 
                 let title_line = Line::styled(
@@ -108,10 +106,7 @@ impl DoneStep {
 
                 let next_chunks = Layout::default()
                     .direction(Direction::Vertical)
-                    .constraints([
-                        Constraint::Length(1),
-                        Constraint::Length(4),
-                    ])
+                    .constraints([Constraint::Length(1), Constraint::Length(4)])
                     .split(chunks[2]);
 
                 let next_title = Line::styled(
@@ -124,17 +119,21 @@ impl DoneStep {
                 next_para.render(next_chunks[0], f.buffer_mut());
 
                 let steps = vec![
-                    Line::styled("  1. Review your .env and registry.json files", theme.text_style()),
-                    Line::styled("  2. Run 'openflows-setup' to reconfigure", theme.text_style()),
+                    Line::styled(
+                        "  1. Review your .env and registry.json files",
+                        theme.text_style(),
+                    ),
+                    Line::styled(
+                        "  2. Run 'openflows-setup' to reconfigure",
+                        theme.text_style(),
+                    ),
                     Line::styled("  3. Run 'openflows' to start", theme.text_style()),
                 ];
                 let steps_para = Paragraph::new(steps);
                 steps_para.render(next_chunks[1], f.buffer_mut());
 
-                let help_line = Line::styled(
-                    "Press Enter to exit...",
-                    Style::default().fg(theme.muted()),
-                );
+                let help_line =
+                    Line::styled("Press Enter to exit...", Style::default().fg(theme.muted()));
                 let help_para = Paragraph::new(help_line).alignment(Alignment::Center);
                 help_para.render(chunks[3], f.buffer_mut());
             })?;

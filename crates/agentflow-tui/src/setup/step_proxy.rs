@@ -10,6 +10,7 @@ use crate::setup::SetupConfig;
 use crate::util::theme::Theme;
 use crate::widgets::input::InputWidget;
 
+#[derive(Default)]
 pub struct ProxyStep;
 
 impl ProxyStep {
@@ -47,7 +48,12 @@ impl ProxyStep {
                 );
                 let title_para = ratatui::widgets::Paragraph::new(vec![title, subtitle]);
                 title_para.render(
-                    ratatui::layout::Rect { x: 2, y: y_start, width: area.width - 4, height: 2 },
+                    ratatui::layout::Rect {
+                        x: 2,
+                        y: y_start,
+                        width: area.width - 4,
+                        height: 2,
+                    },
                     f.buffer_mut(),
                 );
 

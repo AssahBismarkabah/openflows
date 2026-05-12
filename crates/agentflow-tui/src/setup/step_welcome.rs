@@ -9,6 +9,7 @@ use std::io;
 use crate::util::logo::{get_logo_lines, version_string};
 use crate::util::theme::Theme;
 
+#[derive(Default)]
 pub struct WelcomeStep;
 
 impl WelcomeStep {
@@ -22,7 +23,7 @@ impl WelcomeStep {
         _theme: &Theme,
     ) -> Result<()> {
         let theme = Theme::default();
-        
+
         terminal.draw(|f| {
             let area = f.area();
             let logo_lines = get_logo_lines();
