@@ -662,20 +662,6 @@ impl NexusNode {
             "FORGE".to_string()
         };
 
-        // Add comment indicating assignment
-        let comment_body = format!(
-            "🔧 **Assigned to {} for implementation**\n\nThis issue has been assigned to the FORGE worker ({}) for automated implementation. The agent will analyze the requirements, implement the solution, and open a PR when complete.",
-            assignee_display, worker_id.to_uppercase()
-        );
-        client
-            .add_issue_comment(owner, repo, issue_number, &comment_body)
-            .await?;
-
-        // Add assigned/in-progress labels
-        client
-            .add_issue_labels(owner, repo, issue_number, &["assigned", "in-progress"])
-            .await?;
-
         info!(
             worker_id,
             ticket_id,
