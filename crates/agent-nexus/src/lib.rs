@@ -573,7 +573,9 @@ impl NexusNode {
             .with_context(|| format!("Invalid issue URL format: {}", issue_url))?;
 
         // Validate host is github.com (case-insensitive)
-        let host = parsed_url.host_str().ok_or_else(|| anyhow::anyhow!("Missing host in URL"))?;
+        let host = parsed_url
+            .host_str()
+            .ok_or_else(|| anyhow::anyhow!("Missing host in URL"))?;
         if !host.eq_ignore_ascii_case("github.com") {
             anyhow::bail!("URL host must be github.com, got: {}", host);
         }
