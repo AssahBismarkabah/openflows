@@ -109,3 +109,6 @@ orchestration/pairs/
 # Worker worktrees (runtime only)
 worktrees/
 orchestration/
+
+# Kilo runtime data (plans, sessions, node_modules)
+.kilo/
