@@ -877,6 +877,11 @@ impl ForgePairNode {
                     "Push rejected due to secret scanning — scrubbing secrets and rewriting history"
                 );
 
+                // Step 1: Collect the list of secret-containing tracked files
+                // BEFORE untracking them, so rewrite_secret_commits has the
+                // correct file list to remove from git history.
+                let secret_files = Self::list_secret_containing_tracked_files(&worktree_path);
+
                 Self::scan_and_scrub_secrets(&worktree_path)?;
                 Self::git_add_safe(&worktree_path)?;
 
@@ -899,20 +904,62 @@ impl ForgePairNode {
                         .context("Failed to commit secret scrub")?;
                 }
 
-                Self::rewrite_secret_commits(&worktree_path)?;
+                // Step 2: Rewrite git history using the pre-computed file
+                // list.  This removes secret-containing files from ALL
+                // commits, not just the latest one.
+                Self::rewrite_secret_commits_with_files(&worktree_path, &secret_files)?;
 
+                // After filter-branch rewrites history, the local branch
+                // diverges from the remote.  A regular push would be rejected
+                // as non-fast-forward, so we must force-push.
                 let retry_push = StdCommand::new("git")
-                    .args(["push", "-u", "origin", &branch_name])
+                    .args(["push", "-u", "origin", &branch_name, "--force-with-lease"])
                     .current_dir(&worktree_path)
                     .output()
                     .context("Failed to retry push after secret scrub")?;
 
                 if !retry_push.status.success() {
                     let retry_stderr = String::from_utf8_lossy(&retry_push.stderr);
-                    return Err(anyhow!(
-                        "Push still rejected after secret scrub: {}",
-                        retry_stderr
-                    ));
+                    if retry_stderr.contains("GH013")
+                        || retry_stderr.contains("Push cannot contain secrets")
+                    {
+                        // Force-push also rejected by secret scanning — the
+                        // history still contains secrets.  Fall back to bare
+                        // --force as a last resort.
+                        warn!(worker = worker_id, branch = %branch_name, "force-with-lease rejected by secret scanning — trying bare --force");
+                        let bare_force = StdCommand::new("git")
+                            .args(["push", "-u", "origin", &branch_name, "--force"])
+                            .current_dir(&worktree_path)
+                            .output()
+                            .context("Failed to bare-force-push after secret scrub")?;
+                        if !bare_force.status.success() {
+                            let bare_stderr = String::from_utf8_lossy(&bare_force.stderr);
+                            return Err(anyhow!(
+                                "Push still rejected after secret scrub and history rewrite: {}",
+                                bare_stderr
+                            ));
+                        }
+                    } else if retry_stderr.contains("stale info") || retry_stderr.contains("rejected") {
+                        // force-with-lease rejected due to remote changes — fall back to bare --force
+                        warn!(worker = worker_id, branch = %branch_name, "force-with-lease rejected — falling back to --force");
+                        let bare_force = StdCommand::new("git")
+                            .args(["push", "-u", "origin", &branch_name, "--force"])
+                            .current_dir(&worktree_path)
+                            .output()
+                            .context("Failed to bare-force-push after secret scrub")?;
+                        if !bare_force.status.success() {
+                            let bare_stderr = String::from_utf8_lossy(&bare_force.stderr);
+                            return Err(anyhow!(
+                                "Force-push failed after secret scrub: {}",
+                                bare_stderr
+                            ));
+                        }
+                    } else {
+                        return Err(anyhow!(
+                            "Push still rejected after secret scrub: {}",
+                            retry_stderr
+                        ));
+                    }
                 }
             } else if stderr.contains("non-fast-forward") || stderr.contains("fetch first") {
                 info!(worker = worker_id, branch = %branch_name, "Normal push rejected — force-pushing with --force-with-lease");
@@ -1414,22 +1461,57 @@ impl ForgePairNode {
         false
     }
 
-    fn rewrite_secret_commits(worktree_path: &std::path::Path) -> Result<()> {
+    /// Rewrite git history to remove the given files from all commits.
+    ///
+    /// **Important:** The `secret_files` list must be collected BEFORE
+    /// `untrack_secret_containing_files` runs, because that function
+    /// removes files from the git index (making `git ls-files` unable
+    /// to find them).  Passing a pre-computed list ensures filter-branch
+    /// can remove the files from ALL commits in history, not just the
+    /// latest one.
+    fn rewrite_secret_commits_with_files(
+        worktree_path: &std::path::Path,
+        secret_files: &[String],
+    ) -> Result<()> {
         use std::process::Command as StdCommand;
 
         info!(
             path = %worktree_path.display(),
-            "Attempting to rewrite commits containing secrets via git filter-repo"
+            count = secret_files.len(),
+            "Attempting to rewrite commits containing secrets via git filter-branch"
         );
-
-        let secret_files = Self::list_secret_containing_tracked_files(worktree_path);
 
         if secret_files.is_empty() {
             info!(path = %worktree_path.display(), "No tracked files contain secrets — no rewrite needed");
             return Ok(());
         }
 
-        let paths_arg = secret_files.join(" ");
+        // Also discover files that were committed in history but may no
+        // longer be tracked (e.g., already untracked by
+        // untrack_secret_containing_files).  Scan git log for all file
+        // paths that ever appeared and check if they contain secrets.
+        let historical_secret_files = Self::list_secret_containing_historical_files(worktree_path);
+
+        // Merge both lists, deduplicating.
+        let mut all_secret_files: Vec<String> = secret_files.to_vec();
+        for f in &historical_secret_files {
+            if !all_secret_files.contains(f) {
+                all_secret_files.push(f.clone());
+            }
+        }
+
+        if all_secret_files.is_empty() {
+            info!(path = %worktree_path.display(), "No secret-containing files found in current or historical tracking — no rewrite needed");
+            return Ok(());
+        }
+
+        let paths_arg = all_secret_files.join(" ");
+
+        info!(
+            path = %worktree_path.display(),
+            files = %paths_arg,
+            "Rewriting git history to remove secret-containing files"
+        );
 
         let filter = format!(
             r#"git rm --cached --ignore-unmatch {} 2>/dev/null; true"#,
@@ -1452,6 +1534,34 @@ impl ForgePairNode {
         match output {
             Ok(o) if o.status.success() => {
                 info!(path = %worktree_path.display(), "Successfully rewrote commits to remove secret-containing files from tracking");
+                // Clean up the backup refs that filter-branch leaves behind,
+                // so the old objects can be garbage-collected and won't be
+                // pushed to the remote.
+                let _ = StdCommand::new("git")
+                    .args(["for-each-ref", "--format=%(refname)", "refs/original/"])
+                    .current_dir(worktree_path)
+                    .output()
+                    .map(|refs_output| {
+                        let refs = String::from_utf8_lossy(&refs_output.stdout);
+                        for ref_name in refs.lines() {
+                            if !ref_name.is_empty() {
+                                let _ = StdCommand::new("git")
+                                    .args(["update-ref", "-d", ref_name])
+                                    .current_dir(worktree_path)
+                                    .output();
+                            }
+                        }
+                    });
+                // Expire reflog and prune unreachable objects so the old
+                // secret-containing blobs are truly gone from the local repo.
+                let _ = StdCommand::new("git")
+                    .args(["reflog", "expire", "--expire=now", "--all"])
+                    .current_dir(worktree_path)
+                    .output();
+                let _ = StdCommand::new("git")
+                    .args(["gc", "--prune=now", "--aggressive"])
+                    .current_dir(worktree_path)
+                    .output();
             }
             Ok(o) => {
                 let stderr = String::from_utf8_lossy(&o.stderr);
@@ -1473,6 +1583,7 @@ impl ForgePairNode {
         Ok(())
     }
 
+    /// List files that are currently tracked by git and contain secrets.
     fn list_secret_containing_tracked_files(worktree_path: &std::path::Path) -> Vec<String> {
         use std::process::Command as StdCommand;
 
@@ -1496,6 +1607,225 @@ impl ForgePairNode {
             }
         }
         result
+    }
+
+    /// List files that EVER appeared in git history (across all commits)
+    /// and whose current disk content contains secrets.  This catches files
+    /// that were already `git rm --cached` by `untrack_secret_containing_files`
+    /// but whose blobs still exist in older commits.
+    fn list_secret_containing_historical_files(worktree_path: &std::path::Path) -> Vec<String> {
+        use std::process::Command as StdCommand;
+
+        // Get every file path that was ever added across all commits.
+        let log_output = StdCommand::new("git")
+            .args([
+                "log",
+                "--all",
+                "--diff-filter=A",
+                "--name-only",
+                "--pretty=format:",
+            ])
+            .current_dir(worktree_path)
+            .output();
+
+        let mut result = Vec::new();
+        if let Ok(output) = log_output {
+            if output.status.success() {
+                let files = String::from_utf8_lossy(&output.stdout);
+                let mut seen = std::collections::HashSet::new();
+                for file in files.lines() {
+                    let file = file.trim();
+                    if file.is_empty() || seen.contains(file) {
+                        continue;
+                    }
+                    seen.insert(file.to_string());
+                    // Check the current file on disk (if it still exists).
+                    // For files that were removed from the index but still
+                    // exist on disk (e.g., after git rm --cached), this
+                    // catches them.  For files that were truly deleted, we
+                    // rely on the caller's pre-computed list.
+                    let file_path = worktree_path.join(file);
+                    if let Ok(content) = std::fs::read_to_string(&file_path) {
+                        if Self::contains_secrets(&content) {
+                            result.push(file.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        result
+    }
+
+    /// Write ERROR_FEEDBACK.md to the pair-shared directory so that FORGE
+    /// can attempt self-repair on the next pair lifecycle run.
+    ///
+    /// This mirrors the `write_error_feedback` method in pair.rs but is
+    /// usable from agent-forge (outside the pair harness).  The file
+    /// format matches what the pair harness produces, so FORGE's resume
+    /// prompt will include the error context automatically.
+    fn write_error_feedback_to_shared(
+        shared_path: &std::path::Path,
+        source: &str,
+        error_output: &str,
+        hint: Option<&str>,
+    ) {
+        let hint_section = hint
+            .map(|h| format!("## Resolution Hints\n{}\n\n", h))
+            .unwrap_or_default();
+
+        let content = format!(
+            "# Error Feedback — Self-Repair Required\n\n\
+             An error occurred during the pair lifecycle that you must resolve.\n\n\
+             ## Error Source\n{}\n\n\
+             ## Error Output\n```\n{}\n```\n\n\
+             ## Context\n\
+             - Phase: post-implementation push/PR creation\n\
+             - Shared directory: {}\n\n\
+             {}\
+             ## Instructions\n\
+             1. Assess the error output above\n\
+             2. Take the suggested resolution steps (if any)\n\
+             3. If you cannot resolve, write STATUS.json with status BLOCKED\n\
+             4. If you resolve the error, continue with your task and write STATUS.json normally\n",
+            source,
+            error_output,
+            shared_path.display(),
+            hint_section,
+        );
+
+        // Ensure the shared directory exists
+        if let Err(e) = std::fs::create_dir_all(shared_path) {
+            warn!(
+                path = %shared_path.display(),
+                error = %e,
+                "Failed to create shared directory for ERROR_FEEDBACK.md"
+            );
+            return;
+        }
+
+        let path = shared_path.join("ERROR_FEEDBACK.md");
+        match std::fs::write(&path, &content) {
+            Ok(()) => {
+                info!(
+                    path = %path.display(),
+                    source,
+                    "Wrote ERROR_FEEDBACK.md for agent self-repair"
+                );
+            }
+            Err(e) => {
+                warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "Failed to write ERROR_FEEDBACK.md"
+                );
+            }
+        }
+    }
+
+    /// Destroy a contaminated worktree and its local branch so that a fresh
+    /// branch will be created on the next assignment cycle.
+    ///
+    /// When a push is rejected by GitHub push protection (GH013) due to
+    /// secrets in git history, the branch cannot be salvaged — even after
+    /// `git filter-branch` the old objects may persist in reflogs or
+    /// packed refs.  The safest recovery is to destroy the worktree and
+    /// branch entirely, so the next cycle creates a fresh branch from the
+    /// repository's default branch with no contaminated history.
+    fn destroy_contaminated_worktree(
+        workspace_root: &std::path::Path,
+        worker_id: &str,
+    ) -> Result<()> {
+        use std::process::Command as StdCommand;
+
+        let worktree_path = workspace_root.join("worktrees").join(worker_id);
+
+        // Determine the branch name used by this worker (convention:
+        // {worker_id}/T-XXX).  We need to delete the branch after
+        // removing the worktree.
+        let branch_name = if worktree_path.exists() {
+            // Try to read the current branch from the worktree before removing it.
+            let branch = StdCommand::new("git")
+                .args(["rev-parse", "--abbrev-ref", "HEAD"])
+                .current_dir(&worktree_path)
+                .output()
+                .ok()
+                .and_then(|o| {
+                    if o.status.success() {
+                        String::from_utf8(o.stdout).ok().map(|s| s.trim().to_string())
+                    } else {
+                        None
+                    }
+                });
+            branch
+        } else {
+            None
+        };
+
+        info!(
+            worker = worker_id,
+            path = %worktree_path.display(),
+            branch = ?branch_name,
+            "Destroying contaminated worktree to prevent secret-push loop"
+        );
+
+        // Remove the worktree via git worktree remove (force to handle
+        // uncommitted changes).
+        if worktree_path.exists() {
+            let remove_output = StdCommand::new("git")
+                .args(["worktree", "remove", "--force"])
+                .arg(&worktree_path)
+                .current_dir(workspace_root)
+                .output();
+
+            match remove_output {
+                Ok(o) if o.status.success() => {
+                    info!(worker = worker_id, "Contaminated worktree removed successfully");
+                }
+                Ok(o) => {
+                    let stderr = String::from_utf8_lossy(&o.stderr);
+                    warn!(worker = worker_id, error = %stderr, "git worktree remove failed — attempting manual deletion");
+                    // Fall back to manual directory removal
+                    let _ = std::fs::remove_dir_all(&worktree_path);
+                    // Run git worktree prune to clean up stale references
+                    let _ = StdCommand::new("git")
+                        .args(["worktree", "prune"])
+                        .current_dir(workspace_root)
+                        .output();
+                }
+                Err(e) => {
+                    warn!(worker = worker_id, error = %e, "Failed to run git worktree remove — attempting manual deletion");
+                    let _ = std::fs::remove_dir_all(&worktree_path);
+                    let _ = StdCommand::new("git")
+                        .args(["worktree", "prune"])
+                        .current_dir(workspace_root)
+                        .output();
+                }
+            }
+        }
+
+        // Delete the contaminated local branch so a fresh one is created
+        // from the default branch on the next cycle.
+        if let Some(branch) = &branch_name {
+            let delete_output = StdCommand::new("git")
+                .args(["branch", "-D", branch])
+                .current_dir(workspace_root)
+                .output();
+
+            match delete_output {
+                Ok(o) if o.status.success() => {
+                    info!(worker = worker_id, branch = %branch, "Contaminated local branch deleted");
+                }
+                Ok(o) => {
+                    let stderr = String::from_utf8_lossy(&o.stderr);
+                    warn!(worker = worker_id, branch = %branch, error = %stderr, "Failed to delete contaminated branch");
+                }
+                Err(e) => {
+                    warn!(worker = worker_id, branch = %branch, error = %e, "Failed to run git branch -D");
+                }
+            }
+        }
+
+        Ok(())
     }
 }
 
@@ -1648,25 +1978,72 @@ impl BatchNode for ForgePairNode {
                         }
                         Err(e) => {
                             let error_detail = format!("{:#}", e);
-                            let enriched_reason = if error_detail.contains("GH013")
-                                || error_detail.contains("secret")
-                            {
-                                format!(
+                            let is_secret_rejection = error_detail.contains("GH013")
+                                || error_detail.contains("secret");
+
+                            // If the push was rejected due to secrets in git
+                            // history, destroy the contaminated worktree and
+                            // branch so that on the next assignment cycle a
+                            // fresh branch is created from base.  Without this
+                            // cleanup, the worktree reuse logic will pick up
+                            // the contaminated branch and the same push
+                            // failure will repeat indefinitely.
+                            if is_secret_rejection {
+                                let enriched_reason = format!(
                                     "Push rejected: secrets detected in git history — {}",
                                     error_detail
-                                )
-                            } else {
-                                format!("Push failed: {}", error_detail)
-                            };
+                                );
+                                warn!(
+                                    worker = worker_id,
+                                    error = %enriched_reason,
+                                    "Push rejected due to secrets — destroying contaminated worktree"
+                                );
+                                if let Err(cleanup_err) = Self::destroy_contaminated_worktree(
+                                    &self.workspace_root,
+                                    &worker_id,
+                                ) {
+                                    warn!(
+                                        worker = worker_id,
+                                        error = %cleanup_err,
+                                        "Failed to destroy contaminated worktree — manual cleanup may be needed"
+                                    );
+                                }
+                                return Ok(json!({
+                                    "worker_id": worker_id,
+                                    "ticket_id": ticket_id,
+                                    "outcome": "blocked",
+                                    "reason": enriched_reason,
+                                    "blockers": blockers,
+                                }));
+                            }
+
+                            // Non-secret push failure — write ERROR_FEEDBACK.md
+                            // so FORGE can attempt self-repair on the next pair
+                            // lifecycle run.  Return "error_feedback" outcome
+                            // to keep the worker Assigned (not Suspended) so
+                            // the pair can be re-run immediately.
+                            let enriched_reason = format!("Push failed: {}", error_detail);
                             warn!(
                                 worker = worker_id,
                                 error = %enriched_reason,
-                                "Failed to create PR via GitHub API - returning blocked with error detail"
+                                "Push failed — writing ERROR_FEEDBACK.md for FORGE self-repair"
                             );
+
+                            let shared_path = self.workspace_root
+                                .join("worktrees")
+                                .join(&worker_id)
+                                .join(".pair-shared");
+                            Self::write_error_feedback_to_shared(
+                                &shared_path,
+                                "push_operation",
+                                &error_detail,
+                                Some("Check git remote access, branch state, and credentials. Run `git push -u origin HEAD` to retry."),
+                            );
+
                             return Ok(json!({
                                 "worker_id": worker_id,
                                 "ticket_id": ticket_id,
-                                "outcome": "blocked",
+                                "outcome": "error_feedback",
                                 "reason": enriched_reason,
                                 "blockers": blockers,
                             }));
@@ -1798,6 +2175,26 @@ impl BatchNode for ForgePairNode {
                         command_gate.insert(worker_id.to_string(), res.clone());
                     }
                     "idle" => {}
+                    "error_feedback" => {
+                        // Push/PR creation failed with a non-secret error.
+                        // ERROR_FEEDBACK.md was already written to .pair-shared/,
+                        // so FORGE will see it on the next pair lifecycle run.
+                        // Keep the worker in Assigned state so the pair can be
+                        // re-run immediately for self-repair.
+                        let reason = res["reason"].as_str().unwrap_or("push failed");
+                        info!(
+                            worker = worker_id,
+                            ticket = ticket_id,
+                            reason,
+                            "Push failed — ERROR_FEEDBACK.md written, keeping worker Assigned for self-repair"
+                        );
+                        // Worker stays in Assigned/Working state — do NOT
+                        // transition to Suspended or Idle.  The pair lifecycle
+                        // will detect ERROR_FEEDBACK.md on the next run and
+                        // skip plan/final review, going straight to FORGE
+                        // self-repair.
+                        all_success = false;
+                    }
                     "fuel_exhausted" => {
                         warn!(
                             worker = worker_id,

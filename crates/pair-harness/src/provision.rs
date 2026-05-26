@@ -77,65 +77,83 @@ impl Provisioner {
         }
 
         // 5. Symlink plugin to FORGE
-        self.symlink_plugin(worktree, "forge")?;
+        self.symlink_plugin(worktree, "forge", &backend_config)?;
 
         // 6. Symlink plugin to SENTINEL
-        self.symlink_plugin(shared, "sentinel")?;
+        self.symlink_plugin(shared, "sentinel", &backend_config)?;
 
         // 7. Create shared directory structure
         self.create_shared_structure(shared)?;
 
-        // 8. Backend-specific provisioning (Codex: agent TOMLs, hooks, permissions, etc.)
+        // 8. Backend-specific extras (hooks, permissions, AGENTS.md, skills)
         if backend_config.needs_extras_provisioning {
-            self.provision_codex_extras(worktree, shared, github_token, redis_url)?;
+            self.provision_backend_extras(&backend_config, worktree, shared, github_token, redis_url)?;
         }
 
         info!(pair = pair_id, backend = ?cli_backend, "Pair provisioning complete");
         Ok(())
     }
 
-    /// Provision Codex-native extras (.codex/, .agents/, AGENTS.md).
-    fn provision_codex_extras(
+    /// Provision backend-specific extras (hooks, permissions, AGENTS.md, skills).
+    ///
+    /// This is the unified provisioning path for both Claude and Codex backends.
+    /// The `BackendConfig` drives which config directories and file formats are used.
+    fn provision_backend_extras(
         &self,
+        backend_config: &BackendConfig,
         worktree: &Path,
         shared: &Path,
         github_token: &str,
         redis_url: Option<&str>,
     ) -> Result<()> {
-        // 1. Generate .codex/config.toml for FORGE worktree
-        self.generate_codex_config_toml(worktree, shared, github_token, redis_url, "workspace-write")?;
+        let is_codex = backend_config.mcp_config_rel.starts_with(".codex");
 
-        // 2. Generate .codex/config.toml for SENTINEL shared dir
-        self.generate_codex_config_toml(shared, shared, github_token, redis_url, "read-only")?;
+        if is_codex {
+            // Codex: generate .codex/config.toml for FORGE worktree
+            self.generate_codex_config_toml(worktree, worktree, shared, github_token, redis_url, "workspace-write")?;
 
-        // 3. Generate .codex/agents/*.toml for FORGE worktree (both forge + sentinel TOMLs)
-        self.generate_codex_agent_tomls(worktree)?;
+            // Codex: generate .codex/config.toml for SENTINEL shared dir
+            self.generate_codex_config_toml(shared, worktree, shared, github_token, redis_url, "read-only")?;
 
-        // 4. Generate .codex/agents/sentinel.toml in shared dir (SENTINEL runs from shared)
-        self.generate_codex_agent_toml_for_role(shared, "sentinel")?;
+            // Codex: generate .codex/agents/*.toml for FORGE worktree (both forge + sentinel TOMLs)
+            self.generate_codex_agent_tomls(worktree)?;
 
-        // 5. Install hook scripts and generate .codex/hooks.json with relative paths
-        self.generate_codex_hooks_json(worktree, shared)?;
+            // Codex: generate .codex/agents/sentinel.toml in shared dir
+            self.generate_codex_agent_toml_for_role(shared, "sentinel")?;
 
-        // 6. Symlink skills to .agents/skills/ in worktree (all skills for FORGE)
-        self.symlink_skills_to_agents(worktree)?;
+            // Codex: install hook scripts and generate .codex/hooks.json
+            self.generate_codex_hooks_json(worktree, shared)?;
 
-        // 7. Symlink sentinel-relevant skills to .agents/skills/ in shared dir
-        self.symlink_skills_to_agents_for_role(shared, "sentinel")?;
+            // Codex: deploy .codex-plugin/ into both worktree and shared
+            self.deploy_codex_plugin(worktree)?;
+            self.deploy_codex_plugin(shared)?;
 
-        // 8. Deploy .codex-plugin/ (Codex plugin directory) into both worktree and shared
-        self.deploy_codex_plugin(worktree)?;
-        self.deploy_codex_plugin(shared)?;
+            // Codex: generate permission profiles
+            self.generate_codex_permissions(worktree, shared, "workspace-write")?;
+            self.generate_codex_permissions(shared, shared, "read-only")?;
 
-        // 9. Write AGENTS.md at worktree root from forge.agent.md
+            // Codex: symlink skills to .agents/skills/ in worktree (all skills for FORGE)
+            self.symlink_skills_to_agents(worktree)?;
+
+            // Codex: symlink sentinel-relevant skills to .agents/skills/ in shared dir
+            self.symlink_skills_to_agents_for_role(shared, "sentinel")?;
+        } else {
+            // Claude: install hook scripts and generate hooks config in settings.json
+            self.generate_claude_hooks_json(worktree, shared)?;
+
+            // Claude: symlink skills to .claude/skills/ in worktree (all skills for FORGE)
+            self.symlink_skills_to_claude(worktree)?;
+
+            // Claude: symlink sentinel-relevant skills to .claude/skills/ in shared dir
+            self.symlink_skills_to_claude_for_role(shared, "sentinel")?;
+
+            // Claude: enhance settings.json with permission rules
+            self.enhance_claude_permissions(worktree, shared)?;
+        }
+
+        // Both backends: write AGENTS.md
         self.write_agents_md(worktree, "forge")?;
-
-        // 10. Write AGENTS.md at shared root from sentinel.agent.md
         self.write_agents_md(shared, "sentinel")?;
-
-        // 11. Generate Codex permission profiles
-        self.generate_codex_permissions(worktree, shared, "workspace-write")?;
-        self.generate_codex_permissions(shared, shared, "read-only")?;
 
         Ok(())
     }
@@ -168,22 +186,46 @@ impl Provisioner {
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| ".claude/".to_string());
         let settings_entry = format!("{}/", settings_dir_name);
+        // The shared orchestration directory (.pair-shared/) lives inside
+        // the worktree so it is writable under the Codex sandbox.  It must
+        // be gitignored so coordination files (PLAN.md, WORKLOG.md, etc.)
+        // never end up in commits.
+        let shared_entry = format!("{}/", crate::types::PairConfig::SHARED_DIR_NAME);
+        // The backend home directory (e.g., .codex-home/) contains runtime
+        // state files including SQLite databases that may store credentials
+        // used by MCP servers.  It must be gitignored to prevent secrets
+        // from being committed into the repository.
+        let home_entry = if config.home_dir_suffix.is_empty() {
+            None
+        } else {
+            Some(format!("{}/", config.home_dir_suffix))
+        };
 
         let existing = fs::read_to_string(&gitignore_path).unwrap_or_default();
 
-        if !existing.lines().any(|l| l.trim() == settings_entry) {
-            let updated = if existing.is_empty() {
-                format!("{}\n", settings_entry)
-            } else if existing.ends_with('\n') {
-                format!("{}{}\n", existing, settings_entry)
-            } else {
-                format!("{}\n{}\n", existing, settings_entry)
-            };
-            fs::write(&gitignore_path, updated)
+        let mut updated = existing.clone();
+        let mut entries: Vec<&str> = vec![&settings_entry, &shared_entry];
+        if let Some(ref home) = home_entry {
+            entries.push(home);
+        }
+        for entry in &entries {
+            if !updated.lines().any(|l| l.trim() == *entry) {
+                if updated.is_empty() {
+                    updated = format!("{}\n", entry);
+                } else if updated.ends_with('\n') {
+                    updated = format!("{}{}\n", updated, entry);
+                } else {
+                    updated = format!("{}\n{}\n", updated, entry);
+                }
+            }
+        }
+
+        if updated != existing {
+            fs::write(&gitignore_path, &updated)
                 .context("Failed to update .gitignore with settings directory exclusion")?;
             info!(
                 path = %gitignore_path.display(),
-                "Added {} to worktree .gitignore", settings_entry
+                "Updated worktree .gitignore with runtime directories"
             );
         }
 
@@ -215,8 +257,8 @@ impl Provisioner {
         self.write_json(&settings_path, &settings)
     }
 
-    /// Symlink the Sprintless plugin to a .claude directory.
-    pub fn symlink_plugin(&self, target_dir: &Path, role: &str) -> Result<()> {
+    /// Symlink the orchestration plugin to the backend-specific plugin directory.
+    pub fn symlink_plugin(&self, target_dir: &Path, role: &str, backend_config: &BackendConfig) -> Result<()> {
         let plugin_source = self.orchestrator_dir().join("orchestration").join("plugin");
 
         // Check if plugin exists
@@ -229,7 +271,13 @@ impl Provisioner {
             return Ok(());
         }
 
-        let plugins_dir = target_dir.join(".claude").join("plugins");
+        let plugins_dir = target_dir.join(
+            backend_config.plugin_dir_rel.parent().unwrap_or_else(|| {
+                // plugin_dir_rel is e.g. ".claude/plugins/orchestration" or ".agents/plugins/orchestration"
+                // We need the parent: ".claude/plugins" or ".agents/plugins"
+                std::path::Path::new(".claude/plugins")
+            })
+        );
 
         fs::create_dir_all(&plugins_dir).context("Failed to create plugins directory")?;
 
@@ -272,22 +320,35 @@ impl Provisioner {
                 .context("Failed to remove legacy sentinel directory")?;
         }
 
-        // Create .gitignore for shared directory
+        // The shared directory is now inside the worktree and covered by the
+        // worktree's .gitignore, so we no longer need a per-directory
+        // .gitignore here.  However, keep one for backward compatibility
+        // with existing checkouts that still reference the old
+        // `orchestration/pairs/` path.
         let gitignore = shared.join(".gitignore");
-        fs::write(
-            &gitignore,
-            "# Shared artifacts are runtime state, not committed\n*\n!.gitignore\n",
-        )
-        .context("Failed to write .gitignore")?;
+        if !gitignore.exists() {
+            fs::write(
+                &gitignore,
+                "# Shared artifacts are runtime state, not committed\n*\n!.gitignore\n",
+            )
+            .context("Failed to write .gitignore")?;
+        }
 
-        // On re-provision (e.g. CI fix, conflict rework), write a fresh WORKLOG.md
-        // so the watchdog doesn't see a stale mtime from a previous lifecycle and
-        // immediately declare the pair stalled.
+        // On re-provision (e.g. CI fix, conflict rework), append a session
+        // marker to WORKLOG.md rather than wiping it.  This preserves the
+        // FORGE agent's progress notes from previous sessions, which are
+        // valuable for debugging and for the resume prompt.  The watchdog
+        // will see the updated mtime and not declare the pair stalled.
         if already_exists {
             let worklog_path = shared.join("WORKLOG.md");
-            fs::write(&worklog_path, "# Worklog\n\n")
-                .context("Failed to reset WORKLOG.md on re-provision")?;
-            debug!(path = %worklog_path.display(), "Reset WORKLOG.md for re-provisioned pair");
+            let existing = fs::read_to_string(&worklog_path).unwrap_or_default();
+            let marker = format!(
+                "\n---\n\n## Session Restart ({})\n\n",
+                chrono::Local::now().format("%Y-%m-%d %H:%M")
+            );
+            fs::write(&worklog_path, format!("{}{}", existing, marker))
+                .context("Failed to append session marker to WORKLOG.md")?;
+            debug!(path = %worklog_path.display(), "Appended session restart marker to WORKLOG.md");
         }
 
         debug!(path = %shared.display(), "Shared directory structure created");
@@ -307,9 +368,11 @@ impl Provisioner {
     }
 
     /// Generate .codex/config.toml for a given directory.
+    /// Generate .codex/config.toml for a given directory.
     fn generate_codex_config_toml(
         &self,
         target: &Path,
+        worktree: &Path,
         shared: &Path,
         github_token: &str,
         redis_url: Option<&str>,
@@ -367,7 +430,7 @@ args = ["--allowlist", {mcp_shell_args}]
 max_threads = 6
 max_depth = 1
 "#,
-            worktree = target.display(),
+            worktree = worktree.display(),
             shared = shared.display(),
         );
 
@@ -631,6 +694,376 @@ developer_instructions = """
         }
 
         Ok(json!({ "hooks": hooks_map }))
+    }
+
+    /// Generate Claude hooks configuration and install hook scripts.
+    fn generate_claude_hooks_json(&self, worktree: &Path, shared: &Path) -> Result<()> {
+        let hooks_source = self
+            .orchestrator_dir()
+            .join("orchestration")
+            .join("plugin")
+            .join("hooks");
+
+        if !hooks_source.exists() {
+            debug!("Hooks source directory not found, skipping Claude hooks generation");
+            return Ok(());
+        }
+
+        // Install hook scripts for FORGE and update settings
+        self.install_claude_hook_scripts(worktree, "forge", &hooks_source)?;
+        self.add_hooks_to_claude_settings(worktree, "forge", &hooks_source)?;
+
+        // Install hook scripts for SENTINEL and update settings
+        self.install_claude_hook_scripts(shared, "sentinel", &hooks_source)?;
+        self.add_hooks_to_claude_settings(shared, "sentinel", &hooks_source)?;
+
+        info!("Claude hooks configuration generated for FORGE and SENTINEL");
+        Ok(())
+    }
+
+    /// Copy hook scripts from source repo into .claude/hooks/{role}/ in the target directory.
+    fn install_claude_hook_scripts(&self, target: &Path, role: &str, hooks_source: &Path) -> Result<()> {
+        let hook_names: Vec<&str> = match role {
+            "forge" => vec![
+                "session_start",
+                "pre_bash_guard",
+                "pre_write_check",
+                "post_write_lint",
+                "pre_compact_handoff",
+                "stop_require_artifact",
+                "subagent_start",
+                "subagent_stop",
+            ],
+            "sentinel" => vec![
+                "session_start",
+                "pre_bash_readonly_guard",
+                "post_write_validate",
+                "stop_require_eval",
+                "subagent_start",
+                "subagent_stop",
+            ],
+            _ => vec![],
+        };
+
+        let hooks_dest = target.join(".claude").join("hooks").join(role);
+        fs::create_dir_all(&hooks_dest).context("Failed to create Claude hooks directory")?;
+
+        for hook_name in &hook_names {
+            let src = hooks_source.join(role).join(format!("{}.sh", hook_name));
+            if !src.exists() {
+                debug!(
+                    path = %src.display(),
+                    "Hook script not found in source, skipping copy"
+                );
+                continue;
+            }
+            let dst = hooks_dest.join(format!("{}.sh", hook_name));
+            fs::copy(&src, &dst)
+                .context(format!("Failed to copy hook script {}", hook_name))?;
+
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = fs::metadata(&dst)?.permissions().mode();
+                if mode & 0o111 == 0 {
+                    fs::set_permissions(&dst, fs::Permissions::from_mode(mode | 0o755))?;
+                }
+            }
+
+            debug!(
+                src = %src.display(),
+                dst = %dst.display(),
+                "Claude hook script copied"
+            );
+        }
+
+        info!(
+            path = %hooks_dest.display(),
+            role = role,
+            "Claude hook scripts installed"
+        );
+        Ok(())
+    }
+
+    /// Add hooks configuration to existing .claude/settings.json.
+    fn add_hooks_to_claude_settings(&self, target: &Path, role: &str, hooks_source: &Path) -> Result<()> {
+        let settings_path = target.join(".claude").join("settings.json");
+
+        // Read existing settings
+        let mut settings: Value = if settings_path.exists() {
+            let content = fs::read_to_string(&settings_path)
+                .context("Failed to read Claude settings.json")?;
+            serde_json::from_str(&content).unwrap_or_else(|_| json!({}))
+        } else {
+            json!({})
+        };
+
+        let hook_mapping: Vec<(&str, &str, &str)> = match role {
+            "forge" => vec![
+                ("SessionStart", "session_start", "Loading FORGE session context"),
+                ("PreToolUse", "pre_bash_guard", "Checking Bash command"),
+                ("PreToolUse", "pre_write_check", "Validating file write"),
+                ("PostToolUse", "post_write_lint", "Linting after changes"),
+                ("PreCompact", "pre_compact_handoff", "Preparing context reset"),
+                ("Stop", "stop_require_artifact", "Checking for required artifacts"),
+                ("SubagentStart", "subagent_start", "Initializing subagent"),
+                ("SubagentStop", "subagent_stop", "Validating subagent output"),
+            ],
+            "sentinel" => vec![
+                ("SessionStart", "session_start", "Loading SENTINEL session context"),
+                ("PreToolUse", "pre_bash_readonly_guard", "Enforcing read-only mode"),
+                ("PostToolUse", "post_write_validate", "Validating evaluation output"),
+                ("Stop", "stop_require_eval", "Checking for required evaluation"),
+                ("SubagentStart", "subagent_start", "Initializing subagent"),
+                ("SubagentStop", "subagent_stop", "Validating subagent evaluation"),
+            ],
+            _ => vec![],
+        };
+
+        let mut hooks_map = serde_json::Map::new();
+
+        for (event, hook_name, status_msg) in &hook_mapping {
+            let hook_script = hooks_source.join(role).join(format!("{}.sh", hook_name));
+            if !hook_script.exists() {
+                debug!(
+                    path = %hook_script.display(),
+                    "Hook script not found, skipping"
+                );
+                continue;
+            }
+
+            let rel_path = format!("hooks/{}/{}.sh", role, hook_name);
+
+            let hook_entry = json!({
+                "matcher": match *event {
+                    "PreToolUse" => {
+                        match *hook_name {
+                            "pre_bash_guard" | "pre_bash_readonly_guard" => "Bash",
+                            "pre_write_check" => "Write|Edit",
+                            _ => ".*"
+                        }
+                    },
+                    "PostToolUse" => {
+                        match *hook_name {
+                            "post_write_lint" => "Write|Edit",
+                            "post_write_validate" => ".*",
+                            _ => ".*"
+                        }
+                    },
+                    _ => ".*"
+                },
+                "hooks": [{
+                    "type": "command",
+                    "command": rel_path,
+                    "statusMessage": status_msg,
+                }]
+            });
+
+            hooks_map
+                .entry(*event)
+                .or_insert_with(|| Value::Array(vec![]))
+                .as_array_mut()
+                .unwrap()
+                .push(hook_entry);
+        }
+
+        if !hooks_map.is_empty() {
+            settings["hooks"] = Value::Object(hooks_map);
+        }
+
+        self.write_json(&settings_path, &settings)?;
+        info!(path = %settings_path.display(), role = role, "Claude hooks added to settings.json");
+        Ok(())
+    }
+
+    /// Symlink skills to .claude/skills/ in worktree.
+    fn symlink_skills_to_claude(&self, worktree: &Path) -> Result<()> {
+        let skills_source = self.orchestrator_dir().join("orchestration").join("plugin").join("skills");
+
+        if !skills_source.exists() {
+            debug!("Skills source directory not found, skipping Claude skill symlinks");
+            return Ok(());
+        }
+
+        let claude_skills_dir = worktree.join(".claude").join("skills");
+        fs::create_dir_all(&claude_skills_dir).context("Failed to create .claude/skills directory")?;
+
+        for entry in fs::read_dir(&skills_source)? {
+            let entry = entry?;
+            let path = entry.path();
+
+            if !path.is_dir() {
+                continue;
+            }
+
+            let skill_name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("");
+
+            if skill_name.is_empty() {
+                continue;
+            }
+
+            let symlink_path = claude_skills_dir.join(skill_name);
+
+            if symlink_path.exists() || symlink_path.symlink_metadata().is_ok() {
+                let _ = fs::remove_file(&symlink_path);
+            }
+
+            #[cfg(unix)]
+            {
+                std::os::unix::fs::symlink(&path, &symlink_path)
+                    .context(format!("Failed to symlink skill {} to .claude/skills/", skill_name))?;
+            }
+
+            #[cfg(windows)]
+            {
+                std::os::windows::fs::symlink_dir(&path, &symlink_path)
+                    .context(format!("Failed to symlink skill {} to .claude/skills/", skill_name))?;
+            }
+
+            debug!(
+                source = %path.display(),
+                target = %symlink_path.display(),
+                "Skill symlinked to .claude/skills/"
+            );
+        }
+
+        info!(
+            target = %claude_skills_dir.display(),
+            "Skills symlinked to .claude/skills/"
+        );
+        Ok(())
+    }
+
+    /// Symlink role-relevant skills to .claude/skills/ in a target directory.
+    fn symlink_skills_to_claude_for_role(&self, target: &Path, role: &str) -> Result<()> {
+        let skills_source = self.orchestrator_dir().join("orchestration").join("plugin").join("skills");
+
+        if !skills_source.exists() {
+            debug!("Skills source directory not found, skipping Claude role symlinks");
+            return Ok(());
+        }
+
+        let claude_skills_dir = target.join(".claude").join("skills");
+        fs::create_dir_all(&claude_skills_dir).context("Failed to create .claude/skills directory")?;
+
+        let prefix = format!("{}-", role);
+        let shared_prefix = "shared-";
+
+        for entry in fs::read_dir(&skills_source)? {
+            let entry = entry?;
+            let path = entry.path();
+
+            if !path.is_dir() {
+                continue;
+            }
+
+            let skill_name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("");
+
+            if skill_name.is_empty() {
+                continue;
+            }
+
+            if !skill_name.starts_with(&prefix) && !skill_name.starts_with(shared_prefix) {
+                continue;
+            }
+
+            let symlink_path = claude_skills_dir.join(skill_name);
+
+            if symlink_path.exists() || symlink_path.symlink_metadata().is_ok() {
+                let _ = fs::remove_file(&symlink_path);
+            }
+
+            #[cfg(unix)]
+            {
+                std::os::unix::fs::symlink(&path, &symlink_path)
+                    .context(format!("Failed to symlink skill {} to .claude/skills/", skill_name))?;
+            }
+
+            #[cfg(windows)]
+            {
+                std::os::windows::fs::symlink_dir(&path, &symlink_path)
+                    .context(format!("Failed to symlink skill {} to .claude/skills/", skill_name))?;
+            }
+
+            debug!(
+                source = %path.display(),
+                target = %symlink_path.display(),
+                role = role,
+                "Role skill symlinked to .claude/skills/"
+            );
+        }
+
+        info!(
+            target = %claude_skills_dir.display(),
+            role = role,
+            "Role-relevant skills symlinked to .claude/skills/"
+        );
+        Ok(())
+    }
+
+    /// Enhance Claude settings.json with permission rules.
+    fn enhance_claude_permissions(&self, worktree: &Path, shared: &Path) -> Result<()> {
+        // FORGE permissions
+        let forge_settings = worktree.join(".claude").join("settings.json");
+        if forge_settings.exists() {
+            let content = fs::read_to_string(&forge_settings)
+                .context("Failed to read FORGE settings.json")?;
+            let mut settings: Value = serde_json::from_str(&content)
+                .unwrap_or_else(|_| json!({ "permissions": { "defaultMode": "auto" } }));
+
+            // Add permission rules for safety (informational when using --dangerously-skip-permissions)
+            settings["permissions"]["allow"] = json!([
+                { "tool": "Bash", "command": "cargo test" },
+                { "tool": "Bash", "command": "cargo clippy" },
+                { "tool": "Bash", "command": "npm test" },
+                { "tool": "Bash", "command": "npx jest" },
+                { "tool": "Bash", "command": "npx eslint" },
+                { "tool": "Bash", "command": "ruff check" }
+            ]);
+
+            settings["permissions"]["deny"] = json!([
+                { "tool": "Bash", "command": "rm -rf *" },
+                { "tool": "Bash", "command": "sudo *" },
+                { "tool": "Bash", "command": "git push *" },
+                { "tool": "Bash", "command": "npm install *" },
+                { "tool": "Bash", "command": "pip install *" },
+                { "tool": "Bash", "command": "cargo install *" }
+            ]);
+
+            self.write_json(&forge_settings, &settings)?;
+            info!(path = %forge_settings.display(), "Claude FORGE permissions enhanced");
+        }
+
+        // SENTINEL permissions (read-only)
+        let sentinel_settings = shared.join(".claude").join("settings.json");
+        if sentinel_settings.exists() {
+            let content = fs::read_to_string(&sentinel_settings)
+                .context("Failed to read SENTINEL settings.json")?;
+            let mut settings: Value = serde_json::from_str(&content)
+                .unwrap_or_else(|_| json!({ "permissions": { "defaultMode": "auto" } }));
+
+            // SENTINEL is read-only, so deny all write operations
+            settings["permissions"]["deny"] = json!([
+                { "tool": "Write", "pattern": "*" },
+                { "tool": "Edit", "pattern": "*" },
+                { "tool": "Bash", "command": "git *" },
+                { "tool": "Bash", "command": "rm *" },
+                { "tool": "Bash", "command": "sudo *" },
+                { "tool": "Bash", "command": "npm install *" },
+                { "tool": "Bash", "command": "pip install *" }
+            ]);
+
+            self.write_json(&sentinel_settings, &settings)?;
+            info!(path = %sentinel_settings.display(), "Claude SENTINEL permissions enhanced");
+        }
+
+        Ok(())
     }
 
     /// Symlink skills to .agents/skills/ in worktree.
