@@ -62,14 +62,26 @@ pub struct FallbackClient {
     clients: Vec<Box<dyn LlmClient>>,
     current_idx: usize,
     timeout: Duration,
+    max_retries: u32,
+    retry_delay_ms: u64,
 }
 
 impl FallbackClient {
     pub fn new(clients: Vec<Box<dyn LlmClient>>, timeout: Duration) -> Self {
+        let max_retries = std::env::var("LLM_MAX_RETRIES")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(3);
+        let retry_delay_ms = std::env::var("LLM_RETRY_DELAY_MS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1000);
         Self {
             clients,
             current_idx: 0,
             timeout,
+            max_retries,
+            retry_delay_ms,
         }
     }
 
@@ -89,6 +101,48 @@ impl FallbackClient {
             proxy_active,
             fireworks_active, model_override, "Building fallback client chain"
         );
+
+        if let Some(model) = model_override {
+            if let Some(provider) = resolve_provider_for_model(model) {
+                match provider.as_str() {
+                    "fireworks" if FireworksClient::is_configured() => {
+                        info!(
+                            model,
+                            provider = "fireworks",
+                            "Model-aware routing: using FireworksClient directly"
+                        );
+                        return Self::build_fireworks_chain(Some(model));
+                    }
+                    "openai" if has_api_key_for_provider("openai") => {
+                        info!(
+                            model,
+                            provider = "openai",
+                            "Model-aware routing: using OpenAiClient directly"
+                        );
+                        return Self::build_openai_direct_chain(model);
+                    }
+                    "anthropic"
+                        if has_api_key_for_provider("anthropic") && !proxy_is_configured() =>
+                    {
+                        info!(
+                            model,
+                            provider = "anthropic",
+                            "Model-aware routing: using AnthropicClient directly"
+                        );
+                        return Self::build_anthropic_direct_chain(model);
+                    }
+                    _ => {}
+                }
+            }
+
+            if model.starts_with("accounts/fireworks/") && FireworksClient::is_configured() {
+                info!(
+                    model,
+                    "Auto-detected Fireworks model from prefix — using FireworksClient directly"
+                );
+                return Self::build_fireworks_chain(Some(model));
+            }
+        }
 
         if proxy_active {
             return Self::build_proxy_chain(model_override);
@@ -131,6 +185,38 @@ impl FallbackClient {
             .and_then(|s| s.parse().ok())
             .unwrap_or(120);
 
+        Ok(Self::new(clients, Duration::from_secs(timeout_secs)))
+    }
+
+    fn build_openai_direct_chain(model: &str) -> Result<Self> {
+        let mut clients: Vec<Box<dyn LlmClient>> = Vec::new();
+        if let Ok(c) = OpenAiClient::from_env_with_model(model) {
+            info!(provider = "openai-direct", model = %c.model(), "Direct OpenAI client initialized");
+            clients.push(Box::new(c));
+        }
+        if clients.is_empty() {
+            bail!("OpenAI direct mode: OPENAI_API_KEY not set");
+        }
+        let timeout_secs = std::env::var("LLM_TIMEOUT_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(60);
+        Ok(Self::new(clients, Duration::from_secs(timeout_secs)))
+    }
+
+    fn build_anthropic_direct_chain(model: &str) -> Result<Self> {
+        let mut clients: Vec<Box<dyn LlmClient>> = Vec::new();
+        if let Ok(c) = AnthropicClient::from_env_with_model(model) {
+            info!(provider = "anthropic-direct", model = %c.model(), "Direct Anthropic client initialized");
+            clients.push(Box::new(c));
+        }
+        if clients.is_empty() {
+            bail!("Anthropic direct mode: ANTHROPIC_API_KEY not set");
+        }
+        let timeout_secs = std::env::var("LLM_TIMEOUT_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(60);
         Ok(Self::new(clients, Duration::from_secs(timeout_secs)))
     }
 
@@ -379,36 +465,94 @@ impl LlmClient for FallbackClient {
                 );
             }
 
-            let result = tokio::time::timeout(self.timeout, client.send(messages, tools)).await;
+            // Retry with exponential backoff
+            for attempt in 0..self.max_retries {
+                let result = tokio::time::timeout(self.timeout, client.send(messages, tools)).await;
 
-            match result {
-                Ok(Ok(response)) => {
-                    return Ok(response);
-                }
-                Ok(Err(e)) => {
-                    warn!(
-                        provider = client.model(),
-                        error = %e,
-                        "Provider failed, trying next"
-                    );
-                    last_error = Some(e);
-                }
-                Err(_timeout) => {
-                    warn!(
-                        provider = client.model(),
-                        timeout_secs = self.timeout.as_secs(),
-                        "Provider timed out, trying next"
-                    );
-                    last_error = Some(anyhow::anyhow!(
-                        "Provider timed out after {}s",
-                        self.timeout.as_secs()
-                    ));
+                match result {
+                    Ok(Ok(response)) => {
+                        if attempt > 0 {
+                            info!(
+                                provider = client.model(),
+                                attempt = attempt + 1,
+                                "Request succeeded after retry"
+                            );
+                        }
+                        return Ok(response);
+                    }
+                    Ok(Err(e)) => {
+                        let error_str = e.to_string();
+                        let is_retryable = error_str.contains("504")
+                            || error_str.contains("502")
+                            || error_str.contains("503")
+                            || error_str.contains("429")
+                            || error_str.contains("timeout")
+                            || error_str.contains("Gateway")
+                            || error_str.contains("HTTP request")
+                            || error_str.contains("connection")
+                            || error_str.contains("connect");
+
+                        if is_retryable && attempt < self.max_retries - 1 {
+                            let delay_ms = self.retry_delay_ms * (2_u64.pow(attempt));
+                            warn!(
+                                provider = client.model(),
+                                attempt = attempt + 1,
+                                max_retries = self.max_retries,
+                                delay_ms = delay_ms,
+                                error = %e,
+                                "Retryable error, retrying with exponential backoff"
+                            );
+                            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                            continue;
+                        }
+                        warn!(
+                            provider = client.model(),
+                            error = %e,
+                            "Provider failed, trying next"
+                        );
+                        last_error = Some(e);
+                        break;
+                    }
+                    Err(_timeout) => {
+                        if attempt < self.max_retries - 1 {
+                            let delay_ms = self.retry_delay_ms * (2_u64.pow(attempt));
+                            warn!(
+                                provider = client.model(),
+                                attempt = attempt + 1,
+                                max_retries = self.max_retries,
+                                delay_ms = delay_ms,
+                                timeout_secs = self.timeout.as_secs(),
+                                "Provider timed out, retrying with exponential backoff"
+                            );
+                            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                            continue;
+                        }
+                        warn!(
+                            provider = client.model(),
+                            timeout_secs = self.timeout.as_secs(),
+                            "Provider timed out after all retries, trying next"
+                        );
+                        last_error = Some(anyhow::anyhow!(
+                            "Provider timed out after {}s ({} retries exhausted)",
+                            self.timeout.as_secs(),
+                            self.max_retries
+                        ));
+                    }
                 }
             }
         }
 
         match last_error {
-            Some(e) => bail!("All LLM providers failed. Last error: {}", e),
+            Some(e) => bail!(
+                "All {} LLM provider(s) failed. Providers: [{}]. Last error: {}",
+                self.clients.len(),
+                self.clients
+                    .iter()
+                    .map(|c| c.model())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                e
+            ),
             None => bail!("No LLM providers configured"),
         }
     }

@@ -13,7 +13,7 @@ use config::{
 use pocketflow_core::{Action, CiStatus, Node, PrInfo, SharedStore};
 use serde_json::{json, Value};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tracing::{debug, info, warn};
 
 use crate::ci_poller::CiPollResult;
@@ -1053,8 +1053,12 @@ impl VesselNode {
     ) -> Vec<String> {
         let _ = ConflictResolver::abort_rebase(worktree_path).await;
 
+        // Detect the default branch instead of hardcoding "main"
+        let default_branch = Self::detect_default_branch(worktree_path);
+        let origin_ref = format!("origin/{}", default_branch);
+
         let fetch = tokio::process::Command::new("git")
-            .args(["fetch", "origin", "main"])
+            .args(["fetch", "origin", &default_branch])
             .current_dir(worktree_path)
             .output()
             .await;
@@ -1063,24 +1067,24 @@ impl VesselNode {
             Ok(output) if output.status.success() => {}
             Ok(output) => {
                 let stderr = String::from_utf8_lossy(&output.stderr);
-                warn!(branch, %stderr, "git fetch origin/main failed in worktree");
+                warn!(branch, %stderr, "git fetch {} failed in worktree", origin_ref);
                 return vec!["unknown — fetch failed".to_string()];
             }
             Err(e) => {
-                warn!(branch, error = %e, "git fetch origin/main failed in worktree");
+                warn!(branch, error = %e, "git fetch {} failed in worktree", origin_ref);
                 return vec!["unknown — fetch failed".to_string()];
             }
         }
 
         let merge = tokio::process::Command::new("git")
-            .args(["merge", "origin/main", "--no-edit"])
+            .args(["merge", &origin_ref, "--no-edit"])
             .current_dir(worktree_path)
             .output()
             .await;
 
         match merge {
             Ok(output) if output.status.success() => {
-                info!(branch, "origin/main merged cleanly — no conflicts");
+                info!(branch, "{} merged cleanly — no conflicts", origin_ref);
                 vec![]
             }
             Ok(output) => {
@@ -1093,7 +1097,7 @@ impl VesselNode {
                     let retry = tokio::process::Command::new("git")
                         .args([
                             "merge",
-                            "origin/main",
+                            &origin_ref,
                             "--no-edit",
                             "--allow-unrelated-histories",
                         ])
@@ -1105,7 +1109,7 @@ impl VesselNode {
                         Ok(o) if o.status.success() => {
                             info!(
                                 branch,
-                                "origin/main merged cleanly with --allow-unrelated-histories"
+                                "{} merged cleanly with --allow-unrelated-histories", origin_ref
                             );
                             vec![]
                         }
@@ -1133,10 +1137,48 @@ impl VesselNode {
                 files
             }
             Err(e) => {
-                warn!(branch, error = %e, "git merge origin/main failed");
+                warn!(branch, error = %e, "git merge {} failed", origin_ref);
                 vec!["unknown — merge failed".to_string()]
             }
         }
+    }
+
+    /// Detect the repository's default branch by reading origin/HEAD symref,
+    /// falling back to checking remote refs, then defaulting to "main".
+    fn detect_default_branch(project_root: &Path) -> String {
+        // Method 1: Read origin/HEAD symref (most reliable)
+        let output = std::process::Command::new("git")
+            .args(["symbolic-ref", "refs/remotes/origin/HEAD"])
+            .current_dir(project_root)
+            .output();
+
+        if let Ok(o) = output {
+            if o.status.success() {
+                let refname = String::from_utf8_lossy(&o.stdout).trim().to_string();
+                if let Some(branch) = refname.strip_prefix("refs/remotes/origin/") {
+                    if !branch.is_empty() {
+                        return branch.to_string();
+                    }
+                }
+            }
+        }
+
+        // Method 2: Try git rev-parse for each candidate
+        for candidate in ["main", "master"] {
+            let output = std::process::Command::new("git")
+                .args(["rev-parse", "--verify", &format!("origin/{}", candidate)])
+                .current_dir(project_root)
+                .output();
+            if let Ok(o) = output {
+                if o.status.success() {
+                    return candidate.to_string();
+                }
+            }
+        }
+
+        // Final fallback
+        warn!("Could not detect default branch, falling back to 'main'");
+        "main".to_string()
     }
 
     async fn list_conflicted_files(&self, worktree_path: &PathBuf) -> Vec<String> {
@@ -1203,7 +1245,7 @@ impl VesselNode {
         }
         let pair_id = parts[0];
 
-        let ticket_id = pr_info.ticket_id.clone().unwrap_or_else(|| {
+        let _ticket_id = pr_info.ticket_id.clone().unwrap_or_else(|| {
             if let Some(fb) = fallback_ticket_id {
                 info!(
                     branch,
@@ -1223,11 +1265,9 @@ impl VesselNode {
         });
 
         let shared_dir = PathBuf::from(&workspace_root)
-            .join("orchestration")
-            .join("pairs")
+            .join("worktrees")
             .join(pair_id)
-            .join(&ticket_id)
-            .join("shared");
+            .join(".pair-shared");
 
         if !shared_dir.exists() {
             if let Err(e) = tokio::fs::create_dir_all(&shared_dir).await {
@@ -1252,9 +1292,9 @@ impl VesselNode {
         };
 
         let content = format!(
-            "# Conflict Resolution Required\n\n\
-             VESSEL detected merge conflicts between your branch and `origin/main`.\n\
-             `git merge origin/main` has been run in your worktree — conflict markers are present.\n\n\
+             "# Conflict Resolution Required\n\n\
+              VESSEL detected merge conflicts between your branch and the default branch.\n\
+              `git merge origin/<default>` has been run in your worktree — conflict markers are present.\n\n\
              ## Instructions\n\n\
              1. Open each conflicted file listed below\n\
              2. Resolve all conflict markers (`<<<<<<<`, `=======`, `>>>>>>>`)\n\
@@ -1713,14 +1753,12 @@ impl VesselNode {
         // Use ticket_id from PR info (extracted from title), not from branch name.
         // The branch name may be stale or mismatched with the actual ticket.
         // Fall back to branch-derived ticket_id if not available.
-        let ticket_id = pr_placeholder.ticket_id.as_deref().unwrap_or(parts[1]);
+        let _ticket_id = pr_placeholder.ticket_id.as_deref().unwrap_or(parts[1]);
 
         let shared_dir = PathBuf::from(&workspace_root)
-            .join("orchestration")
-            .join("pairs")
+            .join("worktrees")
             .join(pair_id)
-            .join(ticket_id)
-            .join("shared");
+            .join(".pair-shared");
 
         // Ensure the shared directory exists before writing CI_FIX.md.
         // The directory may not exist yet if the pair hasn't been provisioned

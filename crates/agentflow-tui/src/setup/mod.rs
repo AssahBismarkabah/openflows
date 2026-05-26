@@ -242,6 +242,7 @@ pub fn write_registry_file(config: &SetupConfig, project_dir: &std::path::Path) 
     std::fs::create_dir_all(&registry_dir)?;
 
     let registry = config::Registry {
+        default_cli: "claude".to_string(),
         team: if config.agents.is_empty() {
             // Default agents if none configured - use standard token env vars
             vec![

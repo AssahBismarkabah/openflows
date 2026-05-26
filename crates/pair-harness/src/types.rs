@@ -4,6 +4,9 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+// Re-export CliBackend from the config crate — single source of truth.
+pub use config::registry::CliBackend;
+
 /// Filesystem events detected by the watcher.
 /// These drive the event-driven harness state machine.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -56,18 +59,30 @@ pub struct PairConfig {
     pub github_token: String,
     pub max_resets: u32,
     pub watchdog_timeout_secs: u64,
+    /// CLI backend to use for this pair (claude or codex)
+    pub cli_backend: CliBackend,
     pub verify_command: Option<String>,
     pub max_verify_attempts: u32,
 }
 
 impl PairConfig {
-    fn shared_path(project_root: &std::path::Path, pair_id: &str, ticket_id: &str) -> PathBuf {
+    /// Name of the shared orchestration directory inside each worktree.
+    ///
+    /// Placing the shared directory inside the worktree (rather than in
+    /// `orchestration/pairs/`) is required for the Codex `workspace-write`
+    /// sandbox: the sandbox only mounts the workspace root as writable, and
+    /// the `--add-dir` flag has a known bug (Codex v0.130.0) where it
+    /// reports the path as writable in the banner but does NOT create the
+    /// corresponding bind mount in the sandbox namespace.  By locating the
+    /// shared directory inside the worktree, it falls under the existing
+    /// writable bind mount and no `--add-dir` workaround is needed.
+    pub const SHARED_DIR_NAME: &'static str = ".pair-shared";
+
+    fn shared_path(project_root: &std::path::Path, pair_id: &str, _ticket_id: &str) -> PathBuf {
         project_root
-            .join("orchestration")
-            .join("pairs")
+            .join("worktrees")
             .join(pair_id)
-            .join(ticket_id)
-            .join("shared")
+            .join(Self::SHARED_DIR_NAME)
     }
 
     /// Create a new pair configuration with filesystem-based state.
@@ -89,7 +104,8 @@ impl PairConfig {
             proxy_url: None,
             github_token: github_token.into(),
             max_resets: 10,
-            watchdog_timeout_secs: 1200,
+            watchdog_timeout_secs: 3600, // 1 hour - must be > SENTINEL timeout
+            cli_backend: CliBackend::default(),
             verify_command: None,
             max_verify_attempts: 3,
         }
@@ -115,7 +131,8 @@ impl PairConfig {
             proxy_url: None,
             github_token: github_token.into(),
             max_resets: 10,
-            watchdog_timeout_secs: 1200,
+            watchdog_timeout_secs: 3600, // 1 hour - must be > SENTINEL timeout
+            cli_backend: CliBackend::default(),
             verify_command: None,
             max_verify_attempts: 3,
         }
@@ -141,10 +158,17 @@ impl PairConfig {
             proxy_url: Some(proxy_url.into()),
             github_token: github_token.into(),
             max_resets: 10,
-            watchdog_timeout_secs: 1200,
+            watchdog_timeout_secs: 3600, // 1 hour - must be > SENTINEL timeout
+            cli_backend: CliBackend::default(),
             verify_command: None,
             max_verify_attempts: 3,
         }
+    }
+
+    /// Set the CLI backend for this pair.
+    pub fn with_cli_backend(mut self, backend: CliBackend) -> Self {
+        self.cli_backend = backend;
+        self
     }
 }
 
@@ -244,8 +268,14 @@ pub struct SegmentEntry {
 /// Status written to STATUS.json by FORGE.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StatusJson {
-    /// Current status
+    /// Current status — LLMs may write either "status" or "outcome" as the key.
+    /// The `status` field is preferred; `outcome` is a fallback when `status` is absent.
+    #[serde(default)]
     pub status: String,
+    /// Outcome status — some LLMs write "outcome" instead of "status".
+    /// Used as fallback when `status` is empty or absent.
+    #[serde(default)]
+    pub outcome: Option<String>,
     /// Pair identifier (optional - may not be present in all STATUS.json formats)
     #[serde(default)]
     pub pair: Option<String>,
@@ -287,6 +317,21 @@ pub struct StatusJson {
     /// Timestamp (optional)
     #[serde(default)]
     pub timestamp: String,
+}
+
+impl StatusJson {
+    /// Resolve the effective status string.
+    ///
+    /// LLMs inconsistently write either `status` or `outcome` as the top-level key.
+    /// This method returns `status` if present and non-empty, otherwise falls back
+    /// to `outcome`, ensuring both field name variants are handled.
+    pub fn effective_status(&self) -> &str {
+        if !self.status.is_empty() {
+            &self.status
+        } else {
+            self.outcome.as_deref().unwrap_or("")
+        }
+    }
 }
 
 /// Test results summary.
@@ -588,5 +633,40 @@ mod tests {
             }
             other => panic!("Expected List variant, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn test_status_json_outcome_alias() {
+        // LLMs sometimes write "outcome" instead of "status" — must handle both.
+
+        // Case 1: "outcome" only (no "status" field) — the real-world broken case
+        let json_outcome_only = r#"{
+            "outcome": "blocked",
+            "blocker": {"kind": "Other", "description": "Unable to push"}
+        }"#;
+
+        let status: StatusJson = serde_json::from_str(json_outcome_only)
+            .expect("Failed to parse STATUS.json with 'outcome' instead of 'status'");
+        assert_eq!(status.effective_status(), "blocked");
+
+        // Case 2: "status" only — standard format
+        let json_status_only = r#"{
+            "status": "COMPLETE",
+            "pair": "forge-1"
+        }"#;
+
+        let status: StatusJson = serde_json::from_str(json_status_only)
+            .expect("Failed to parse STATUS.json with standard 'status' field");
+        assert_eq!(status.effective_status(), "COMPLETE");
+
+        // Case 3: Both "outcome" and "status" present — "status" takes precedence
+        let json_both = r#"{
+            "outcome": "REJECTED",
+            "status": "COMPLETE"
+        }"#;
+
+        let status: StatusJson = serde_json::from_str(json_both)
+            .expect("Failed to parse STATUS.json with both outcome and status");
+        assert_eq!(status.effective_status(), "COMPLETE");
     }
 }

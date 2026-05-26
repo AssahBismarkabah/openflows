@@ -90,9 +90,13 @@ impl WorkspaceManager {
             github_token, self.repo_id
         );
 
-        // Run git clone
+        // Clone the full main branch history (not --depth 1).
+        // Shallow clones cannot create worktrees or new branches,
+        // which breaks the FORGE-SENTINEL pair isolation model.
+        // --single-branch --no-tags avoids fetching unrelated history
+        // while still providing enough commits for branching.
         let output = Command::new("git")
-            .args(["clone", "--depth", "1"])
+            .args(["clone", "--single-branch", "--no-tags"])
             .arg(&clone_url)
             .arg(&self.workspace_dir)
             .output()
@@ -109,6 +113,9 @@ impl WorkspaceManager {
 
     /// Update an existing workspace with git pull.
     fn update_workspace(&self) -> Result<()> {
+        // Unshallow if needed — worktree/branch operations require full history
+        self.unshallow_if_needed();
+
         // Fetch and pull latest changes
         let output = Command::new("git")
             .args(["fetch", "origin"])
@@ -120,27 +127,52 @@ impl WorkspaceManager {
             warn!(stderr = %String::from_utf8_lossy(&output.stderr), "Git fetch failed, continuing anyway");
         }
 
+        // Detect the default branch instead of hardcoding "main"
+        let default_branch =
+            crate::worktree::WorktreeManager::detect_default_branch(&self.workspace_dir);
         let output = Command::new("git")
-            .args(["pull", "--rebase", "origin", "main"])
+            .args(["pull", "--rebase", "origin", &default_branch])
             .current_dir(&self.workspace_dir)
             .output()
             .context("Failed to execute git pull")?;
 
         if !output.status.success() {
-            // Try with master if main fails
-            let output = Command::new("git")
-                .args(["pull", "--rebase", "origin", "master"])
-                .current_dir(&self.workspace_dir)
-                .output()
-                .context("Failed to execute git pull")?;
-
-            if !output.status.success() {
-                warn!(stderr = %String::from_utf8_lossy(&output.stderr), "Git pull failed, continuing anyway");
-            }
+            warn!(stderr = %String::from_utf8_lossy(&output.stderr), default_branch = %default_branch, "Git pull from origin/{} failed, continuing anyway", default_branch);
         }
 
         info!(workspace = %self.workspace_dir.display(), "Workspace updated");
         Ok(())
+    }
+
+    /// Unshallow the repository if it was cloned with --depth 1.
+    /// Worktree and branch operations require full history.
+    fn unshallow_if_needed(&self) {
+        let shallow_file = self.workspace_dir.join(".git").join("shallow");
+        if !shallow_file.exists() {
+            return;
+        }
+
+        info!(workspace = %self.workspace_dir.display(), "Unshallowing repository for worktree support");
+
+        let output = Command::new("git")
+            .args(["fetch", "--unshallow"])
+            .current_dir(&self.workspace_dir)
+            .output();
+
+        match output {
+            Ok(o) if o.status.success() => {
+                info!(workspace = %self.workspace_dir.display(), "Repository unshallowed successfully");
+            }
+            Ok(o) => {
+                warn!(
+                    stderr = %String::from_utf8_lossy(&o.stderr),
+                    "git fetch --unshallow failed, worktree operations may not work"
+                );
+            }
+            Err(e) => {
+                warn!(error = %e, "Failed to run git fetch --unshallow");
+            }
+        }
     }
 
     /// Remove the workspace directory.
@@ -155,19 +187,9 @@ impl WorkspaceManager {
 
     /// Get the default branch name for the repository.
     pub fn get_default_branch(&self) -> Result<String> {
-        let output = Command::new("git")
-            .args(["symbolic-ref", "--short", "HEAD"])
-            .current_dir(&self.workspace_dir)
-            .output()
-            .context("Failed to get default branch")?;
-
-        if output.status.success() {
-            let branch = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            Ok(branch)
-        } else {
-            // Default to main if we can't determine
-            Ok("main".to_string())
-        }
+        Ok(crate::worktree::WorktreeManager::detect_default_branch(
+            &self.workspace_dir,
+        ))
     }
 }
 

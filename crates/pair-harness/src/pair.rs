@@ -24,10 +24,32 @@ use crate::watchdog::Watchdog;
 use crate::watcher::SharedDirWatcher;
 use crate::worktree::{MergeMainResult, SetupWarning, WorktreeManager};
 
-const DEFAULT_SENTINEL_TIMEOUT_SECS: u64 = 120;
-const FORGE_STARTUP_TIMEOUT_SECS: u64 = 300;
+/// Default SENTINEL timeout in seconds. Can be overridden via SPRINTLESS_SENTINEL_TIMEOUT_SECS env var.
+/// Must be greater than LLM_TIMEOUT_SECS to allow the LLM time to respond.
+const DEFAULT_SENTINEL_TIMEOUT_SECS: u64 = 600; // 10 minutes
+
+/// Default FORGE startup timeout. Can be overridden via SPRINTLESS_FORGE_STARTUP_TIMEOUT_SECS env var.
+/// FORGE needs time to initialize and write PLAN.md.
+const DEFAULT_FORGE_STARTUP_TIMEOUT_SECS: u64 = 600; // 10 minutes
+
 const MAX_SENTINEL_RETRIES: u32 = 2;
 const MIN_SENTINEL_RETRY_INTERVAL_SECS: u64 = 30;
+
+/// Get the SENTINEL timeout from environment or use default.
+fn get_sentinel_timeout_secs() -> u64 {
+    std::env::var("SPRINTLESS_SENTINEL_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_SENTINEL_TIMEOUT_SECS)
+}
+
+/// Get the FORGE startup timeout from environment or use default.
+fn get_forge_startup_timeout_secs() -> u64 {
+    std::env::var("SPRINTLESS_FORGE_STARTUP_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(DEFAULT_FORGE_STARTUP_TIMEOUT_SECS)
+}
 
 /// Normalize agent-written STATUS.json status strings to canonical values.
 ///
@@ -274,6 +296,16 @@ struct SentinelTracker {
     timeout_secs: u64,
 }
 
+/// Tracks whether a SENTINEL process is actively running or its spawn was
+/// deferred due to the retry interval.  The deferred variant prevents the
+/// event loop from spinning when `check_sentinel_retry_interval()` returns
+/// false — the caller treats "deferred" the same as "active" for the purpose
+/// of deciding whether to wait rather than re-spawn.
+enum SentinelState {
+    Active(SentinelTracker),
+    Deferred { retry_after: Instant },
+}
+
 struct SentinelFailureInfo {
     mode: SentinelMode,
     reason: String,
@@ -338,7 +370,7 @@ pub struct ForgeSentinelPair {
     reset: ResetManager,
     watchdog: Watchdog,
     start_time: Instant,
-    sentinel_tracker: Option<SentinelTracker>,
+    sentinel_tracker: Option<SentinelState>,
     forge_spawn_time: Instant,
     sentinel_retries: SentinelRetryState,
     last_sentinel_spawn_time: Option<Instant>,
@@ -349,13 +381,20 @@ pub struct ForgeSentinelPair {
     contract_timeout: Option<TimeoutProfile>,
     error_feedback_attempts: u32,
     verification_state: VerificationState,
+    /// Counts consecutive rapid FORGE exits (<30s). Used to break infinite
+    /// respawn loops when progress files are stale from a previous lifecycle.
+    rapid_exit_count: u32,
 }
+
+/// Maximum consecutive rapid FORGE exits before giving up.
+const MAX_RAPID_EXITS: u32 = 5;
 
 impl ForgeSentinelPair {
     /// Create a new ForgeSentinelPair.
     pub fn new(config: PairConfig) -> Self {
         // Use the project_root from config (contains .git)
         let project_root = config.project_root.clone();
+        let cli_backend = config.cli_backend;
 
         Self {
             worktree: WorktreeManager::new(&project_root),
@@ -365,14 +404,29 @@ impl ForgeSentinelPair {
                     &config.github_token,
                     Some(redis_url.clone()),
                     proxy_url,
-                ),
-                (Some(redis_url), None) => {
-                    ProcessManager::with_redis(&config.github_token, redis_url)
+                    &config.worktree,
+                    &config.shared,
+                )
+                .with_default_backend(cli_backend),
+                (Some(redis_url), None) => ProcessManager::with_redis(
+                    &config.github_token,
+                    redis_url,
+                    &config.worktree,
+                    &config.shared,
+                )
+                .with_default_backend(cli_backend),
+                (None, Some(proxy_url)) => ProcessManager::with_proxy(
+                    &config.github_token,
+                    None,
+                    proxy_url,
+                    &config.worktree,
+                    &config.shared,
+                )
+                .with_default_backend(cli_backend),
+                (None, None) => {
+                    ProcessManager::new(&config.github_token, &config.worktree, &config.shared)
+                        .with_default_backend(cli_backend)
                 }
-                (None, Some(proxy_url)) => {
-                    ProcessManager::with_proxy(&config.github_token, None, proxy_url)
-                }
-                (None, None) => ProcessManager::new(&config.github_token),
             },
             reset: ResetManager::new(config.shared.clone(), config.max_resets),
             watchdog: Watchdog::new(config.shared.clone(), config.watchdog_timeout_secs),
@@ -389,6 +443,7 @@ impl ForgeSentinelPair {
             final_approved: false,
             contract_timeout: None,
             error_feedback_attempts: 0,
+            rapid_exit_count: 0,
         }
     }
 
@@ -601,8 +656,16 @@ impl ForgeSentinelPair {
         watcher: &mut SharedDirWatcher,
     ) -> Result<PairOutcome> {
         loop {
+            // Check if a deferred SENTINEL spawn interval has elapsed.
+            if let Some(SentinelState::Deferred { retry_after }) = &self.sentinel_tracker {
+                if Instant::now() >= *retry_after {
+                    debug!("SENTINEL spawn defer interval elapsed — clearing deferred state");
+                    self.sentinel_tracker = None;
+                }
+            }
+
             // Check if SENTINEL has already exited.
-            if let Some(tracker) = &mut self.sentinel_tracker {
+            if let Some(SentinelState::Active(tracker)) = &mut self.sentinel_tracker {
                 match tracker.child.try_wait() {
                     Ok(Some(status)) => {
                         let mode = tracker.mode.clone();
@@ -619,7 +682,9 @@ impl ForgeSentinelPair {
                                 mode: mode.clone(),
                                 reason: format!("exit code {:?}", status.code()),
                             });
-                            self.sentinel_retries.reset(&mode);
+                            // Do NOT reset retry counter on failure — let it accumulate
+                            // so MAX_SENTINEL_RETRIES eventually triggers the synthetic
+                            // rejection fallback that breaks the loop.
                         }
                         self.sentinel_tracker = None;
                     }
@@ -632,7 +697,7 @@ impl ForgeSentinelPair {
             }
 
             // Check for SENTINEL timeout
-            if let Some(tracker) = &mut self.sentinel_tracker {
+            if let Some(SentinelState::Active(tracker)) = &mut self.sentinel_tracker {
                 if tracker.spawn_time.elapsed().as_secs() > tracker.timeout_secs {
                     warn!(
                         mode = ?tracker.mode,
@@ -655,19 +720,21 @@ impl ForgeSentinelPair {
                             stderr_excerpt.as_deref(),
                         )
                         .await;
-                    self.sentinel_retries.reset(&mode);
+                    // Do NOT reset retry counter on timeout — same as error exit,
+                    // let it accumulate so MAX_SENTINEL_RETRIES breaks the loop.
                     self.sentinel_tracker = None;
                 }
             }
 
             // Check for FORGE startup timeout (no PLAN.md written)
+            let forge_startup_timeout = get_forge_startup_timeout_secs();
             let plan_path = self.config.shared.join("PLAN.md");
             if !plan_path.exists()
-                && self.forge_spawn_time.elapsed().as_secs() > FORGE_STARTUP_TIMEOUT_SECS
+                && self.forge_spawn_time.elapsed().as_secs() > forge_startup_timeout
             {
                 error!(
                     "FORGE startup timeout - no PLAN.md after {}s",
-                    FORGE_STARTUP_TIMEOUT_SECS
+                    forge_startup_timeout
                 );
 
                 // Check if FORGE is still running
@@ -901,10 +968,44 @@ impl ForgeSentinelPair {
                     }
                 } else if self.has_progress_files().await {
                     // FORGE made progress - determine what SENTINEL action is needed
-                    if self.sentinel_tracker.is_some() {
+                    //
+                    // IMPORTANT: progress files may be stale from a previous lifecycle.
+                    // If FORGE ran for less than 30 seconds, it almost certainly didn't
+                    // complete a segment — it likely crashed on startup.  Treat this as
+                    // a startup error rather than "segment work completed" to avoid an
+                    // infinite respawn loop.
+                    let forge_uptime = self.forge_spawn_time.elapsed().as_secs();
+                    if forge_uptime < 30 && !self.reset.has_handoff() {
+                        self.rapid_exit_count += 1;
+                        if self.rapid_exit_count >= MAX_RAPID_EXITS {
+                            error!(
+                                consecutive_exits = self.rapid_exit_count,
+                                "FORGE repeatedly exits within 30s — giving up (check FORGE stderr logs for startup errors)"
+                            );
+                            return Ok(PairOutcome::Blocked {
+                                reason: format!(
+                                    "FORGE exited {} times within 30 seconds — likely a startup error. \
+                                     Check forge-stderr.log in the shared directory.",
+                                    self.rapid_exit_count
+                                ),
+                                blockers: vec![],
+                            });
+                        }
+                        warn!(
+                            elapsed_secs = forge_uptime,
+                            consecutive = self.rapid_exit_count,
+                            "FORGE exited quickly with stale progress files — likely startup error, not segment completion"
+                        );
+                        // Treat the same as "no progress" quick exit: retry with backoff
+                        tokio::time::sleep(Duration::from_secs(5)).await;
+                        *forge = self.spawn_forge().await?;
+                    } else if self.sentinel_tracker.is_some() {
                         info!("FORGE exited but SENTINEL is active - waiting for completion");
                         tokio::time::sleep(Duration::from_secs(5)).await;
                     } else {
+                        // FORGE ran for a healthy duration — reset rapid exit counter
+                        self.rapid_exit_count = 0;
+
                         // Check the lifecycle phase and spawn SENTINEL if needed
                         let plan_exists = self.config.shared.join("PLAN.md").exists();
                         let contract_exists = self.config.shared.join("CONTRACT.md").exists();
@@ -962,11 +1063,28 @@ impl ForgeSentinelPair {
                     // No progress files - check if FORGE just started and may not have had time
                     let forge_uptime = self.forge_spawn_time.elapsed().as_secs();
                     if forge_uptime < 30 {
+                        self.rapid_exit_count += 1;
+                        if self.rapid_exit_count >= MAX_RAPID_EXITS {
+                            error!(
+                                consecutive_exits = self.rapid_exit_count,
+                                "FORGE repeatedly exits within 30s — giving up (check FORGE stderr logs for startup errors)"
+                            );
+                            return Ok(PairOutcome::Blocked {
+                                reason: format!(
+                                    "FORGE exited {} times within 30 seconds — likely a startup error. \
+                                     Check forge-stderr.log in the shared directory.",
+                                    self.rapid_exit_count
+                                ),
+                                blockers: vec![],
+                            });
+                        }
                         // Very quick exit - likely a startup error, retry
                         warn!(
-                            "FORGE exited quickly ({}s) without progress - retrying spawn",
-                            forge_uptime
+                            elapsed_secs = forge_uptime,
+                            consecutive = self.rapid_exit_count,
+                            "FORGE exited quickly without progress - retrying spawn"
                         );
+                        tokio::time::sleep(Duration::from_secs(5)).await;
                         *forge = self.spawn_forge().await?;
                     } else {
                         // Ran for a while but produced nothing - synthesize handoff and respawn
@@ -1027,6 +1145,7 @@ impl ForgeSentinelPair {
                 &self.config.shared,
                 &self.config.github_token,
                 self.config.redis_url.as_deref(),
+                self.config.cli_backend,
             )
             .await
     }
@@ -1077,7 +1196,16 @@ impl ForgeSentinelPair {
         );
 
         let path = self.config.shared.join("ERROR_FEEDBACK.md");
-        tokio::fs::write(&path, &content).await?;
+        // Ensure the shared directory exists — write_error_feedback can be called
+        // early (e.g. from provision_worktree) before create_shared_structure runs.
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent)
+                .await
+                .context("Failed to create shared directory for ERROR_FEEDBACK.md")?;
+        }
+        tokio::fs::write(&path, &content)
+            .await
+            .context("Failed to write ERROR_FEEDBACK.md")?;
 
         info!(
             path = %path.display(),
@@ -1094,7 +1222,9 @@ impl ForgeSentinelPair {
     async fn clear_error_feedback(&self) -> Result<()> {
         let path = self.config.shared.join("ERROR_FEEDBACK.md");
         if path.exists() {
-            tokio::fs::remove_file(&path).await?;
+            tokio::fs::remove_file(&path)
+                .await
+                .context("Failed to remove ERROR_FEEDBACK.md")?;
             debug!("Removed ERROR_FEEDBACK.md — error resolved");
         }
         Ok(())
@@ -1185,7 +1315,9 @@ impl ForgeSentinelPair {
             return Ok(String::new());
         }
 
-        let content = tokio::fs::read_to_string(&path).await?;
+        let content = tokio::fs::read_to_string(&path)
+            .await
+            .context("Failed to read error_history.json")?;
         let history: ErrorHistory = match serde_json::from_str(&content) {
             Ok(h) => h,
             Err(_) => return Ok(String::new()),
@@ -1403,7 +1535,7 @@ impl ForgeSentinelPair {
                 };
                 (base, profile.complexity.clone())
             }
-            None => (DEFAULT_SENTINEL_TIMEOUT_SECS, Complexity::Medium),
+            None => (get_sentinel_timeout_secs(), Complexity::Medium),
         };
         compute_effective_timeout(base_secs, &complexity)
     }
@@ -1426,6 +1558,12 @@ impl ForgeSentinelPair {
     /// Spawn SENTINEL for plan review.
     async fn spawn_sentinel_for_plan(&mut self) -> Result<()> {
         if !self.check_sentinel_retry_interval() {
+            // Spawning is deferred — record this so the event loop knows to
+            // wait rather than spinning on the "FORGE exited" branch.
+            self.sentinel_tracker = Some(SentinelState::Deferred {
+                retry_after: Instant::now() + Duration::from_secs(MIN_SENTINEL_RETRY_INTERVAL_SECS),
+            });
+            debug!("SENTINEL plan review spawn deferred — retry interval not yet elapsed");
             return Ok(());
         }
         let mode = SentinelMode::PlanReview;
@@ -1454,12 +1592,12 @@ impl ForgeSentinelPair {
             )
             .await?;
 
-        self.sentinel_tracker = Some(SentinelTracker {
+        self.sentinel_tracker = Some(SentinelState::Active(SentinelTracker {
             mode: SentinelMode::PlanReview,
             spawn_time: Instant::now(),
             child,
             timeout_secs,
-        });
+        }));
 
         Ok(())
     }
@@ -1467,6 +1605,15 @@ impl ForgeSentinelPair {
     /// Spawn SENTINEL for segment evaluation.
     async fn spawn_sentinel_for_segment(&mut self, segment: u32) -> Result<()> {
         if !self.check_sentinel_retry_interval() {
+            // Spawning is deferred — record this so the event loop knows to
+            // wait rather than spinning.
+            self.sentinel_tracker = Some(SentinelState::Deferred {
+                retry_after: Instant::now() + Duration::from_secs(MIN_SENTINEL_RETRY_INTERVAL_SECS),
+            });
+            debug!(
+                segment,
+                "SENTINEL segment eval spawn deferred — retry interval not yet elapsed"
+            );
             return Ok(());
         }
         let mode = SentinelMode::SegmentEval(segment);
@@ -1496,12 +1643,12 @@ impl ForgeSentinelPair {
             )
             .await?;
 
-        self.sentinel_tracker = Some(SentinelTracker {
+        self.sentinel_tracker = Some(SentinelState::Active(SentinelTracker {
             mode: SentinelMode::SegmentEval(segment),
             spawn_time: Instant::now(),
             child,
             timeout_secs,
-        });
+        }));
 
         Ok(())
     }
@@ -1515,6 +1662,12 @@ impl ForgeSentinelPair {
         }
 
         if !self.check_sentinel_retry_interval() {
+            // Spawning is deferred — record this so the event loop knows to
+            // wait rather than spinning.
+            self.sentinel_tracker = Some(SentinelState::Deferred {
+                retry_after: Instant::now() + Duration::from_secs(MIN_SENTINEL_RETRY_INTERVAL_SECS),
+            });
+            debug!("SENTINEL final review spawn deferred — retry interval not yet elapsed");
             return Ok(());
         }
         let mode = SentinelMode::FinalReview;
@@ -1544,12 +1697,12 @@ impl ForgeSentinelPair {
             )
             .await?;
 
-        self.sentinel_tracker = Some(SentinelTracker {
+        self.sentinel_tracker = Some(SentinelState::Active(SentinelTracker {
             mode: SentinelMode::FinalReview,
             spawn_time: Instant::now(),
             child,
             timeout_secs,
-        });
+        }));
 
         Ok(())
     }
@@ -1846,10 +1999,11 @@ impl ForgeSentinelPair {
             }
         };
 
-        let normalized = normalize_status(&status.status);
-        if normalized != status.status {
+        let effective = status.effective_status().to_string();
+        let normalized = normalize_status(&effective);
+        if normalized != effective {
             info!(
-                raw = %status.status,
+                raw = %effective,
                 normalized = %normalized,
                 "Normalized unrecognized STATUS.json status to canonical value"
             );
@@ -1910,7 +2064,7 @@ impl ForgeSentinelPair {
                 }
                 if status.pr_url.as_ref().is_some_and(|url| !url.is_empty()) {
                     warn!(
-                        status = %status.status,
+                        status = %status.effective_status(),
                         pr_url = status.pr_url.as_deref().unwrap_or_default(),
                         "Unrecognized STATUS.json status with PR metadata — treating as PR_OPENED"
                     );
@@ -1939,18 +2093,19 @@ impl ForgeSentinelPair {
                         | `SEGMENT_N_DONE` | Non-terminal | Segment N complete |\n\n\
                         The agent wrote an unrecognized status. Nexus should interpret the raw status\n\
                         intent and re-map it to the closest valid status above, then re-assign the worker.",
-                        status.status, normalized
+                        status.effective_status(), normalized
                     );
                     let _ = tokio::fs::write(&unrecognized_path, &remap_content).await;
 
                     warn!(
-                        status = %status.status,
+                        status = %status.effective_status(),
                         "Unrecognized STATUS.json status — treating as blocked (STATUS_UNRECOGNIZED.md written for Nexus fallback)"
                     );
                     PairOutcome::Blocked {
                         reason: format!(
                             "Unrecognized STATUS.json status: {} (normalized: {})",
-                            status.status, normalized
+                            status.effective_status(),
+                            normalized
                         ),
                         blockers: vec![],
                     }
@@ -2433,9 +2588,7 @@ mod tests {
 
         assert_eq!(config.pair_id, "pair-1");
         assert!(config.worktree.starts_with("/project/worktrees/"));
-        assert!(config
-            .shared
-            .ends_with("orchestration/pairs/pair-1/T-1/shared"));
+        assert!(config.shared.ends_with("worktrees/pair-1/.pair-shared"));
         assert!(config.redis_url.is_none());
     }
 
